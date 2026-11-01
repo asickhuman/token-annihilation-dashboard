@@ -1,3 +1,25 @@
+# Spark local model routing (approved 2026-10-29; labels corrected 2026-10-29)
+
+Strata is the **serving engine**, not a model. IQ3_S / NVFP4 are quant formats.
+
+| Role | What runs | Endpoint |
+|------|-----------|----------|
+| **Primary** — general + **code review** | **Qwen3.8-Flash-Next GSQ-RCO-IQ3_S via Strata** (`qwen3.8-flash-next-iq3_s`) | `http://127.0.0.1:8080/v1` |
+| **Code generation only** (never reviews) | **Qwen3.8-Flash-Next FP4 via TensorFold** (`Qwen3.8-Flash-Next`) | `http://127.0.0.1:8888/v1` (Docker) |
+| Kept installed, not primary | **Qwen3.8 27B Q4_K_M via Ollama** (`qwen3.8:27b`), **Swift-1.5 27B GSQ-RCO-IQ3_S via Ollama** (`swift-1.5:27b-gsq-rco-iq3_s`) | Ollama proxy `127.0.0.1:11435` |
+| Vision / art QC | `qwen2.5vl:32b` via Ollama | `:11435` |
+
+Also installed under Strata (not primary): Qwen3.8-Flash-Next NVFP4-GPTQ via Strata (`qwen3.8-flash-next-nvfp4-nvfp4`).
+
+Shared GPU: stop Flash/TensorFold before launching Strata and vice versa.
+Brief: `~/share/context/digital-veil-brief.md` · env: `~/share/scripts/model-routing.env` · chat: `~/share/scripts/dv-chat.sh` (prepends brief as system to Strata/Flash).
+Ollama fallback with brief: `qwen27b-dv` (FROM `qwen3.8:27b`) — not a Strata model.
+Eval: all-model 0% (or 0% with non-blank answers) = **SCORER-SUSPECT**.
+
+---
+
+## Prior notes
+
 # Token Annihilation Dashboard — Ollama routing
 
 **Date:** 2026-10-28  
@@ -7,7 +29,7 @@
 |------|---------|
 | Ollama (unchanged) | `127.0.0.1:11434` |
 | Proxy (token-annihilator) | `127.0.0.1:11435` → forwards to `:11434` |
-| Dashboard | `http://100.126.27.23:11480` |
+| Dashboard | `http://127.0.0.1:11480` |
 | Service | `systemctl --user status token-annihilator` |
 
 ## One-line revert

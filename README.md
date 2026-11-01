@@ -21,7 +21,7 @@ A single-file, stdlib-only Python proxy that sits in front of [Ollama](https://o
 Requires Python 3.8+ and nothing else.
 
 ```bash
-git clone https://github.com/SaltShaker87/token-annihilation-dashboard ~/token-annihilation-dashboard
+git clone https://github.com/asickhuman/token-annihilation-dashboard ~/token-annihilation-dashboard
 cd ~/token-annihilation-dashboard
 python3 token_annihilator.py            # try it in the foreground
 ```
