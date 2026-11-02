@@ -291,9 +291,162 @@ def cloud_total_tokens():
     grok_tok = int(grok_tok or 0)
     return codex + grok_tok, codex, grok_tok
 
-def load_cloud_providers():
+
+OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
+CLOUD_SNAP_JSONL = os.path.join(CLOUD_DIR, "cloud_snapshots.jsonl")
+
+BOT_AVATARS = {
+    "Veil PM": ("#FF6700", "pumpkin"),
+    "dr eggbot": ("#111111", "teardrop"),
+    "Zonk Bot": ("#9159FE", "cloud"),
+    "Veil Assets": ("#FF309B", "flower"),
+    "Veil Triage": ("#FF263C", "wedge"),
+    "Model Evals": ("#1084FE", "sparkle"),
+    "Token CEO": ("#00C972", "hex"),
+}
+
+def _bot_avatar_svg(name, size=28):
+    color, shape = BOT_AVATARS.get(name, ("#888888", "hex"))
+    c = html.escape(color, quote=True)
+    paths = {
+        "pumpkin": '<ellipse cx="16" cy="18" rx="11" ry="9.5" fill="%s"/><rect x="14.5" y="6" width="3" height="4" rx="1" fill="#6b4a2a"/>' % c,
+        "teardrop": '<path d="M16 4 C24 14 24 21 16 28 C8 21 8 14 16 4 Z" fill="%s"/>' % c,
+        "cloud": '<circle cx="11" cy="18" r="5.5" fill="%s"/><circle cx="17" cy="15" r="7" fill="%s"/><circle cx="23" cy="18" r="5" fill="%s"/><rect x="9" y="18" width="16" height="6" rx="3" fill="%s"/>' % (c, c, c, c),
+        "flower": '<circle cx="16" cy="10" r="4.5" fill="%s"/><circle cx="16" cy="22" r="4.5" fill="%s"/><circle cx="10" cy="16" r="4.5" fill="%s"/><circle cx="22" cy="16" r="4.5" fill="%s"/><circle cx="16" cy="16" r="3.2" fill="%s"/>' % (c, c, c, c, c),
+        "wedge": '<path d="M16 5 L27 25 L5 25 Z" fill="%s"/>' % c,
+        "sparkle": '<path d="M16 3 L19 13 L29 16 L19 19 L16 29 L13 19 L3 16 L13 13 Z" fill="%s"/>' % c,
+        "hex": '<path d="M16 4 L27 10.5 L27 21.5 L16 28 L5 21.5 L5 10.5 Z" fill="%s"/>' % c,
+    }
+    body = paths.get(shape, paths["hex"])
+    return '<svg class="bot-av" width="%d" height="%d" viewBox="0 0 32 32" aria-hidden="true">%s</svg>' % (size, size, body)
+
+def _opencode_model_label(raw):
+    if not raw:
+        return "local"
+    try:
+        if isinstance(raw, str) and raw.startswith("{"):
+            o = json.loads(raw)
+            if isinstance(o, dict):
+                return str(o.get("id") or "local")
+    except Exception:
+        pass
+    return str(raw)[:48]
+
+def _cloud_snapshot_log():
+    try:
+        os.makedirs(CLOUD_DIR, exist_ok=True)
+        entry = {"ts": time.time(), "iso": datetime.now().isoformat(timespec="seconds")}
+        try:
+            with open(GROK_CLOUD_JSON) as f:
+                entry["grok"] = json.load(f)
+        except Exception:
+            entry["grok"] = None
+        try:
+            today, week, alltime = _codex_session_token_totals()
+            entry["codex"] = {"today": today, "week": week, "all": alltime}
+        except Exception:
+            entry["codex"] = None
+        with open(CLOUD_SNAP_JSONL, "a") as f:
+            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+def _opencode_provider(range_key="all"):
+    """Live OpenCode usage from local SQLite (free local models)."""
+    import sqlite3
+    from datetime import timedelta
+    path = OPENCODE_DB
+    if not os.path.isfile(path):
+        return {
+            "id": "opencode", "title": "OpenCode", "status": "not_linked",
+            "plan": "free · local", "meters": [], "stats": [],
+            "note": "missing ~/.local/share/opencode/opencode.db", "range_real": False,
+        }
+    today = _today_et()
+    def day_start_ms(d):
+        try:
+            from zoneinfo import ZoneInfo
+            dt = datetime(d.year, d.month, d.day, tzinfo=ZoneInfo("America/New_York"))
+        except Exception:
+            from datetime import timezone, timedelta as td
+            dt = datetime(d.year, d.month, d.day, tzinfo=timezone(td(hours=-5)))
+        return int(dt.timestamp() * 1000)
+
+    key = (range_key or "all").lower()
+    key = RANGE_ALIASES.get(key, key)
+    if key not in ("all", "today", "dod", "mtd", "weekly", "monthly", "yearly"):
+        key = "all"
+    if key in ("today", "dod"):
+        start_ms, end_ms = day_start_ms(today), day_start_ms(today + timedelta(days=1))
+    elif key == "weekly":
+        start_ms, end_ms = day_start_ms(today - timedelta(days=6)), day_start_ms(today + timedelta(days=1))
+    elif key == "mtd":
+        start_ms, end_ms = day_start_ms(today.replace(day=1)), day_start_ms(today + timedelta(days=1))
+    elif key == "monthly":
+        start_ms, end_ms = day_start_ms(today - timedelta(days=29)), day_start_ms(today + timedelta(days=1))
+    elif key == "yearly":
+        start_ms, end_ms = day_start_ms(today.replace(month=1, day=1)), day_start_ms(today + timedelta(days=1))
+    else:
+        start_ms = end_ms = None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        try:
+            if start_ms is None:
+                row = con.execute(
+                    "SELECT COALESCE(SUM(tokens_input),0),COALESCE(SUM(tokens_output),0),"
+                    "COALESCE(SUM(tokens_reasoning),0),COUNT(*) FROM session_v2"
+                ).fetchone()
+                models = con.execute(
+                    "SELECT model,COUNT(*),SUM(COALESCE(tokens_input,0)+COALESCE(tokens_output,0)) "
+                    "FROM session_v2 GROUP BY model ORDER BY 3 DESC LIMIT 5"
+                ).fetchall()
+            else:
+                row = con.execute(
+                    "SELECT COALESCE(SUM(tokens_input),0),COALESCE(SUM(tokens_output),0),"
+                    "COALESCE(SUM(tokens_reasoning),0),COUNT(*) FROM session_v2 "
+                    "WHERE time_created>=? AND time_created<?", (start_ms, end_ms)
+                ).fetchone()
+                models = con.execute(
+                    "SELECT model,COUNT(*),SUM(COALESCE(tokens_input,0)+COALESCE(tokens_output,0)) "
+                    "FROM session_v2 WHERE time_created>=? AND time_created<? "
+                    "GROUP BY model ORDER BY 3 DESC LIMIT 5", (start_ms, end_ms)
+                ).fetchall()
+        finally:
+            con.close()
+    except Exception as e:
+        return {
+            "id": "opencode", "title": "OpenCode", "status": "awaiting",
+            "plan": "free · local", "meters": [], "stats": [],
+            "note": "db error: %s" % e, "range_real": False,
+        }
+    tin, tout, treas, njobs = [int(x or 0) for x in row]
+    tot = tin + tout + treas
+    top_model = _opencode_model_label(models[0][0]) if models else "—"
+    pct = min(100.0, 100.0 * tot / 2_000_000.0) if key in ("today", "dod") else (100.0 if tot else 0.0)
+    return {
+        "id": "opencode", "title": "OpenCode", "status": "live",
+        "plan": "free · local",
+        "meters": [{"label": "Local usage", "pct": pct,
+                    "detail": "model %s · free (local)" % top_model}],
+        "stats": [
+            {"label": "Tokens", "value": tot},
+            {"label": "Jobs", "value": njobs},
+            {"label": "In", "value": tin},
+            {"label": "Out", "value": tout},
+        ],
+        "note": "%s jobs · %s" % ("{:,}".format(njobs), top_model),
+        "range_real": True, "range_key": key, "top_model": top_model,
+    }
+
+
+def load_cloud_providers(range_key="all"):
     """Data-driven provider list for the CLOUD USAGE panel. Add entries to extend."""
+    _cloud_snapshot_log()
     providers = []
+    range_key = (range_key or "all").lower()
+    range_key = RANGE_ALIASES.get(range_key, range_key)
+    if range_key not in ("all", "today", "dod", "mtd", "weekly", "monthly", "yearly"):
+        range_key = "all"
 
     # 1) Codex / GPT
     pace = _kv_file(CODEX_PACE)
@@ -366,7 +519,7 @@ def load_cloud_providers():
                 "pct": float(grok["used_pct"]),
                 "detail": ("resets " + str(grok["resets"])) if grok.get("resets") else "",
             })
-        for b in (grok.get("bots") or [])[:4]:
+        for b in (grok.get("bots") or []):
             if not isinstance(b, dict):
                 continue
             if b.get("pct") is None:
@@ -404,16 +557,8 @@ def load_cloud_providers():
             "note": "awaiting data",
         })
 
-    # 3) OpenCode placeholder — extend by replacing this entry later
-    providers.append({
-        "id": "opencode",
-        "title": "OpenCode",
-        "status": "not_linked",
-        "plan": "—",
-        "meters": [],
-        "stats": [],
-        "note": "not linked yet",
-    })
+    # 3) OpenCode — local models via opencode.db (free)
+    providers.append(_opencode_provider(range_key))
     return providers
 
 def render_cloud_usage_cards(providers, compact=False, show_stats=None):
@@ -441,19 +586,21 @@ def render_cloud_usage_cards(providers, compact=False, show_stats=None):
                 except Exception:
                     pct_s = "—"
                     pct_f = 0.0
-                lab = html.escape(str(m.get("label") or "Usage"))
+                raw_lab = str(m.get("label") or "Usage")
+                lab = html.escape(raw_lab)
                 det = html.escape(str(m.get("detail") or ""))
                 meter = _pct_meter_html(segs, pct_f, True)
+                av = (_bot_avatar_svg(raw_lab) + " ") if (p.get("id") == "grok" and raw_lab in BOT_AVATARS) else ""
                 body.append(
                     "<div class=cluse-meter>"
                     "<div class=cluse-meter-hd>"
-                    "<span class=lbl>%s</span>"
+                    "<span class=lbl>%s%s</span>"
                     "<span class='cluse-pct vfd'>%s%%</span>"
                     "</div>"
                     "<div class='tach-track cluse-tach'>%s</div>"
                     "%s"
                     "</div>"
-                    % (lab, pct_s, meter,
+                    % (av, lab, pct_s, meter,
                        ("<div class='cluse-detail muted'>%s</div>" % det) if det else "")
                 )
             for s in (p.get("stats") or []) if show_stats else []:
@@ -583,24 +730,38 @@ def money(x): return "${:,.4f}".format(x) if x < 1 else "${:,.2f}".format(x)
 def ghost_digits(s):
     return "".join("8" if c.isdigit() else c for c in str(s))
 
-RANGES = ("all", "dod", "mtd", "weekly", "monthly", "yearly")
+RANGES = ("all", "today", "dod", "mtd", "weekly", "monthly", "yearly")
 RANGE_META = {
     "all": ("ALL", "TOTAL TOKENS ANNIHILATED", "Lifetime · all recorded proxy traffic"),
-    "dod": ("DoD", "TOKENS ANNIHILATED, TODAY", "Day over day · today vs yesterday"),
+    "today": ("TODAY", "TOKENS ANNIHILATED, TODAY", "Today (America/New_York)"),
+    "dod": ("DoD", "TOKENS ANNIHILATED, DoD", "Day over day · today vs yesterday"),
     "mtd": ("MTD", "TOKENS ANNIHILATED, MTD", "Month to date · 1st through today"),
     "weekly": ("7D", "TOKENS ANNIHILATED, 7D", "Rolling week · last 7 days"),
     "monthly": ("30D", "TOKENS ANNIHILATED, 30D", "Rolling month · last 30 days"),
     "yearly": ("YTD", "TOKENS ANNIHILATED, YTD", "Year to date · Jan 1 through today"),
 }
+RANGE_ALIASES = {"7d": "weekly", "30d": "monthly", "ytd": "yearly", "week": "weekly", "month": "monthly", "year": "yearly"}
+
+def _today_et():
+    """Calendar date in America/New_York."""
+    from datetime import datetime, timezone, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
 
 def _range_dates(key):
-    from datetime import date, timedelta
-    today = date.today()
+    from datetime import timedelta
+    today = _today_et()
     key = (key or "all").lower()
+    key = RANGE_ALIASES.get(key, key)
     if key not in RANGES:
         key = "all"
     if key == "all":
         return None, None, None, None, key
+    if key == "today":
+        return today.isoformat(), today.isoformat(), None, None, key
     if key == "dod":
         y = today - timedelta(days=1)
         return today.isoformat(), today.isoformat(), y.isoformat(), y.isoformat(), key
@@ -651,6 +812,8 @@ def stats_payload(range_key="all"):
                 "label": "vs yesterday (%s)" % ps,
             }
             subtitle = "Today (%s) vs yesterday (%s)" % (start, ps)
+        elif key == "today":
+            subtitle = "Today (America/New_York) · %s" % start
         elif key == "all":
             subtitle = "Lifetime"
         else:
@@ -820,12 +983,14 @@ def page():
             continue
         v = tin / 1e6 * p["input_per_mtok"] + tout / 1e6 * p["output_per_mtok"]
         mv = money(v)
+        mv_num = mv[1:] if mv.startswith("$") else mv
         sav += (
             "<div class='card bill'><div class=bill-row>"
-            "<div class='big dseg seg' data-val='%s' data-ghost='%s'>%s</div>"
+            "<div class='bill-amt'><span class='bill-cur'>$</span>"
+            "<span class='big dseg seg' data-val='%s' data-ghost='%s'>%s</span></div>"
             "<div class=bill-meta><div class=lbl title='%s'>Kept from %s</div>"
             "<div class=muted>$%s/$%s per M in/out</div></div></div></div>"
-            % (mv, ghost_digits(mv), mv, html.escape(p["label"], quote=True), html.escape(p["label"]),
+            % (mv_num, ghost_digits(mv_num), mv_num, html.escape(p["label"], quote=True), html.escape(p["label"]),
                p["input_per_mtok"], p["output_per_mtok"])
         )
 
@@ -840,7 +1005,7 @@ def page():
     lights.extend(spark_temp_lights())
     lights_html = "".join('<span class="wl %s%s">%s</span>' % (c, " on" if on else "", lab) for lab, on, c in lights)
 
-    range_tabs = range_tabs_html("all", include_mobile=True)
+    range_tabs = range_tabs_html("all", include_mobile=False)
     T = "DGX Token Annihilator Dashboard"
     VFD_B64 = 'd09GMgABAAAAAC7MABEAAAAAsoAAAC5qAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGigbIByHHgZgAIFSCHoJmhYRCAqCrxyCglEBNgIkA4NoC4F2AAQgBYV8ByAMgRgbFpoV7JgFbgcEqeL4+KKoJuUxKkoq1bPs/2/JjSGCdVCz9kiyHaUNqSCrhTO3q5WFSjiY1KVDWQ2RzrvIwILYLFIg0SCRcW+eJQWijp43J3/hLUqkIHtpxI2GLQeiT2xO1Fv5i+1yslDRWPu9Or93BraN/ElOXnj+P6fVff9LssjmOOBURQF2gO1QKVSUFDvdUWHSAMQrGABc9XJwN2fCA3C/fJeBhx/wQCu0Vk1RoKPRgQw8m3zN8+//9z/13efwzFyQk0jRcx5xgfCqTllluTguZ6nAXreEPx8NgIFzrnlCEx/YaNaB1Y/OIZ37vwM/PJgV8dQMItdUTJA2FUdU5m+jjH972/bhCdc+C0ICxUw6BcoW6GBL+XQImWL2wwldoePUy5bn+01l6qy5VEjrTPKgN7F7JTVa56as4rfm4yrzMHWmmpuYfor4l3iYSZbLaZlfyaXJlrSy1mddaTXNM+EfFJgHOAQ8D+Fh6WbJ2t07bkEyuZdsU7FIq5Z7mR6akq7DqjlnInfzrsbHmQKAMJWdCs9WfxCvwAO4/Hkv+WPv8yA8MYaxFJ0aI2pE/95Us33vL3CEqLsz6AhnyhF3VSoax9i5qV2Rb/8G/o9A/AVABIqmFqTmBlRcKC54HARSjGNLmU4JlGOoLgC8lHLlLve+otS4aF25qFy6KFW76Wy/b2lJ7/qCDG0CTViI2Az5zYz2+0m3qktRsjM6bDrVv7p3p6ZHYS+EYGqADDBK6SHeVIPazcvWqhJk4nXg3BQbQ4tN56CJwbju47v/j82eN3eVXKQLscgvoSBYO7/fT+mP2dwtpb3X1VjWAkiZAQbM3+6IAN/+mVEMSokom6JM20Sc6gJCgKveRtLcvFTBZgDWw27c9PY/yhWoBy2xvXbeGWQUQQertn8hMNnQVQJ7G3srgZMGM/sDVwwbkfuGexflK0iJyEag6PE3Xbm4od6/+f6t9x97/3bQuSHx1bXTzmP3xmknn8jK1jlrx3J4GlxjM3Hmsadxylk7S7tAu0y7pv1Ne+ccdwZ3HJ1/1rk8kLJbeAxk21cJX3O0uBbTlGZpWjOk2fFVLk+zLyshpcmqC3xyuOYf8yVNcorcJm/In+VfAp1Q6nlRfWSnddhku0VLdthpjfAoKfXa9QjNmDVnXoUu1otVhM2t2lhu9LTQm3NE78c6SBLZpcW6WE5YQlbWELdQixYl57c0pat2nzEPDCWLlFcdUCwJu2hHzNr9Ied5Su75+WHKjDk3sfiFDN6k4oQkZpL1WqLtCW2TwsrcHnqZ+yAaPL+nx/7lImlk87p7f7xvnNJigtIlWJOeep0ScsqURpMgNqWjLdTIBcrcMJavyYnJVkUxDMZki7o5FUbkLrkLE+pErQCLH5cuSwz6B8DMsP9I7SYsD47eyVcEQZsO1ktglKFKVJVT1Q8EG1SoZY5B+ugxfHFX66Rorj5lof1WnewUl7jCh0EuaHt2XHGg37gZB6w5xakuPQ9m73kK6+/WH8Oz4Tmsn+KvA4CoA6MgtJJSA7eS+qfgioMipzrbuQ45wYn2Os1RTrHfEcsOO9PpznDAOY6zz/EusOpixzjPsc5yspPsB1Zg3Uuq7C78Q0f4f1ZVlbtgfYWn1lP1fQr9A2USoSiwnEYmsvmPxJ5NrPtPieEDOl7zmZTlF5R1/+3UYzLTqfMeIpjTYY/AHAMCgjgLKMhc+ApjlE99R3Y5mo2wLpNHmx18Tl69Kysn7L7JufDVjay0qfRqUoEbujkdwqj13bF+0Q+Cr7aRMym31AncgbwTgV64X2wURl8E2cwc4mYKu9PCLKAhI8Gwbi6Y3EuYGrE0Ou8NiYAB9eplXs1xlDU5G3PkdM6hYnhQ0SMvWJQS/L2Vvfa3WzHKfsp7rjuwpOZNCO8T4s4vg7pPTTZBjI96FEtg2TFx41WgOXao8RkyQQJzFIhB7PR5nP0z0lg6u4Rhl508lJdlo48tJI7iQ887OPVxiLkI1yyuMIdhWUalucqcK0WBz0GCLhkylEPbbWx4+6V416Zo+YE0nYFP3jxIvTffvEzeqbeHPhBHVY1LjqvDQAJIiOBzo+gfyhqNeA33YrwykISQGo495J+RJqW5/ulllrJqJy5BLyqFzaNUjenQbj8Pz/SHnd6N7afNw0XKeatlozOoJOeO2yVXiNRI0s2bsrJY/Qrj7ZBtFbTtpTpwgxiyWG456TM/8vrF/Ik5E6j+Wl9va/icEOf9Jw3GaTqjd5UVtA4RwnQvOa9eBFmcq1ALR4mkRhnhacRVVETJSP2dXjvPMuexrP5nOt3c7Ae3LJBDJfsoUIUqH5BnCqqZhhpmQC0zoY5ZUGAxqGc2bGDOSCeU87ZYsXmUVBrkc3IsD3Rd6MoHft6zu6st8PtbvRHnGD00bMCNGKBgIwo2oWAzCragYCsKtqFgOwp2oJSKkPYehZ7tM+mQgS7lYBxtiaKYpnv0gh6nZ4Tr+iAyaR5BV7slfRpO3yhc4Mn+ce0s2/SNqpm3RumpeZccYKX5pdIg5JWrA0NvDkGXPRQQ77m5bpj8r1eT950u1cFc5dmvZRjSysTaHMzpv6HACJprbWC03QaEs6d7jqGqtH1HGixA85Q4b73ccq2l3EmauqfqDdDYj2bZuvwwUALkSbGUYV5vc9E4fLQovSrSltL1+yinpcFxMTSCCsJqxrjS8Db9VCcXA/dTlYt1FrPohE0pzcBBHbuDGnwURc5k/JVxMYp5rmh2c2erruzQzNuG8BvUqQhG0XG35BSbY5QJneCQWWYxzZe2kWgEfrhpHSZiAaMEI82CkGWeJ2tobEuJcQ4G5CRjFpHTdum4a8LBNtljTj1S5BKTet0Tg909qaRGWvVuZy2WCebwpyxbzVt/sfORa3pPG1ESmtaJqR0xb65F/vvf0F9zbMvTUGkYfJnHpJj23IElaa2pvTn3KLDJ8NkHbm/xsNu0wT/2DCh5b/5ZUPYSnLSpdZil1G47DDb0SphzyKclFOvuHVVpRceXEL3zqHbLYqt9eQf/W0xSlgKg/HR8q0vOJ0fGm3uwMELpEQejm1GBjNfSCMLyGLfEqia36nmM7UtnoeHRB7L1vG2oyCLFiNqwHYx1sHhp5EcqjYxLc2VJLeH+TaHAxWk7Z/ECMI/oYgLubgh6mIC3B7CAPibg74ZggMn2weIlgBnAkCYQXgvBiCYiCmHCYizC4kxYgolI0uEcS1EBm90Q3GIC2z2AzbjDBNLdEMwwkbxLOMuy+gpyayGY10QWBAksagKltRAsa7K1UjwH46Mnq7XUW4wJ1JAV9QHXJeLx3eI5NMNeEGr7QQgHQ2ACEQ8DE3gUmBDHgm/xxNjCaRDCWRDC+RCY3OJFYBIvA5N4FZjEa0PATRDCbRDC3RCYEngfmMKHwBQ+BqbwyRDwHITwEoS7vK7ebTfUP6qXwnWftR3/lm7ZffIKbiMkJAww23df4h/Vf8CnaKtAextAHgQY+OMAiiYUKZlqro9pZQGILslFA/g8pawD6qRRQ8WbdbSbDZopLUw6N3PW6lYfyjwTSA7+v6lgZBmCCDEkQ+eqjOVk4++Ga2giJEoQIapa//cuMTTQy8jEyKSIK1AkEgoRy2boNZIkSdlUltfLsJD0nMTKA6j/KL2f3hcjJBpDiCQR4wol5ykkWjRyBLEoQmekTCbpJzMkJemPSfpFCCEUIwhiASG0ilwEsY6I3xDz+3wOB8IIYTMU+99tYzK5TFOo3LgT4mDS9huBELPQKsGKuwC8paxWArWl6obwM1ZVgJgYFxPnJkCqq1OUj0pAMzNxabFbQV1t2yZ1rZJhJXC7VW3NqIzZiJsBUcRVVKYVY2TLZbihCbTta+z1nC67gHakkfXqLQ9/eewBQfdhszOnB5jFtbK6upeloOTx6MifODPoar+1txrKHfOPDb+DasRB5dQKpEWGMSLZIt7GxzxjyKj4xu5gtNq5nnl8Nf3SMWl4drA/ROsUojy+HFD0+Ulsb2iI/IX6Qx+NrGGZ3PeDYIeVU1gv7bluS+C1li/Bt2H7AMkwmR9cOxjRJlWiAJ19YnIqSLq2+DsQJYjT2glLLmwJ2EYaYvFPDLsNR15XDbu2d23WIKplD+P0PWWEIjOyU+ZZnfeU6noHWZnAiL7sd5eJ4Q63HbcNrJCf1pYlHgwmhzBaiolDzIhE+33d0kmsQAtS8eDSm4eCXS9L6KK1+PCoXPc5rxnFqzZHwov8UVCRjc+0QUY/S3wQuKNYWpmzVT+YSpYfqTUdeCO3xD6zyJS7Uu5Tl1HG0zTdZosnpVXpQXY+EMpoCukml7vOgtKLWoMkaR+kDkfXlUmJsSldkptMi/J33M5dcayp/RIYHxuc1e3jXlMU8+ZcDBgpMwfPFco+OPW6mxJEQ9a4K3s4sQqJqzgfVmCi1+WrRoxGZ3cvVnBo5TkkhuYocK0S2+ouaFg/giOE+YkuiR9NH3pptqIxvbn8Hh+A5x29oNiONPy7RqD0wLgVuYld/QCZAroszcHStUlozkO8G90DahYSPE4r5DaGB9hjnnkyjlFcbrU/YqBg0hOYPuVPr7GonOlKmOwlx5Gnb0QndJ5ji+Q+mwuSPtyn60HMT1d3xcD5tmpOdtv2qWaawiK4reI5TxVAyrwW3DX5OdfmDkC6L4me3gPJNhkBi/u6gWkghxKyO2itFLQCm0RixiIYyu0dRJ04qt4ikgphDidS1OEnjx7yaFKXy8dKRmIardiWW1+v6SxK+2VTplesBiFAF4cDsd2Xly30VLez/CMZofrkpBtSWZUhGf+6ekp8aA/7jl29A+xzUBi7IK8Yh6JzX5ZJSdS/WaaRvuNMHZcJ2vPnGaalv8tPZefbJJaVtoFd6p0/pVm9lt2Osfa2S7XqUDUd5R5InZdxhZIPT4Rj8+zs7W+o8/T1Y/5S+t/PmLQvJcm/MwyKfGUCZWvs6BnIl/qzbca0hbqez29U3vqUXVJQksi2CgWMhPUovzsZ6LHX/tLdLmJSyLQ9SlkxrZCQeQSg7Ksn9hkQO4w6O6gnUjpjbrcJfS09gu6AYV2kWSQ0TitNIQ5ezDN1+dZztdmwKgnQnDn72st7EHkMi6VIB6c9TdJLXIsS53LI6bCd/I9DgMEXszYwaXnqv7VkmqsvGUP+7KlUVoBNxrINKC8T9ktnZsJH4EXYTgyMCY9EOBv/Oj1qdo4Rehs5RrEsNggfE5DH9LIb4O6pB9F3K6s3/lndLcrcXvzJxTsRUZOqjFzMF7AY95q5YMzzqZQFKrbodiy8jf4LiIOQSpF+L+71+jjKcN9luPPsZOkLbZmtOMT85cmxNokKPWweozeO2mjNxEXASON7FxmdNE56UVlBt72IobvopVs7RSQl4mUxrnyR6taOi7BzBSqXohYW4U4EDgSigI5PotthoGJ6e+0XpdZCUlOgewYA7vPH84gtRLTQqhZXWgkeyIAxLArEbLQ3d9NAB0QuP6nuQiLA7zDSAAC7hOVzBJehuQNg+DElB2/eT5nFZhEHLnZvvdK99mVz4IiW3vRlv2Cuuq+tBflzCgczdJDnOpXBbWZmRY+YT+gLy34P6zBr9Yr4cCxgIMemf/yqmFqyY8zUgQDs5y7uOLWaMJe3O5czbEklJQLq4xUf+AMCJxjrLlZM2U0MG6SCmulDWdSVJjICGH0Td+rC4/EaO0P1kTHlCEdiHPuiq9bcsE2f2OvMX1FL+UAmU3LEBBXH2xL7b56jMy8yQnLRf6BjC0Ii2MQRUPPaVpoiLqiRw5ipfwaz50josMgZt5C/dM8VAWPja2vxgFSg0iTf/pzFnm8LhseRyUGPDnYGaAPRAcFqD7ebsED2OIF0apytcrL7ar4aTTl5G27LLuoJJpImtp5Mvf16qktZeK7pVADYNEpYGckYMkhLTBlIFnN0pvIZ8t/XgJudPxiHc+eOna7aN6uAM9VvLQZ6XxQ93d/rcEcYYW1cyfdNTVbyrskXGtmr3uwIMy8fKwV7XhDzhlgFa+2rO+/IXCaCF4Gftv8OZqIaHTJwEkECHae6FxlAWvojUAHVQXg+whkLUO41jgAl/+Z4/2Fj3GRNrEL9pf3WvLtIpweiSGuQtWf/uNhKx1S3bKIHumQGlZJhZpDhULsnHUGqf2Ju1MVEgOAEJqeaaKrrqvAXoCmfIEjqzXQF/sVEvbSx6VM/VCXvwSZPj8yOgFXlvE2ConkzbUE+tgffcK2vUVeXykSl5ijqKm8d9yPxMvcxk+LYrQTHajjyANdRHJsV4lisi+qLCrIX6R9xefCGoLax9sGNQOTtggifrK/MIbf6w5Dn0iMJmByo0cm3WqWMD254ZoVYjfc9P5ZiNlMcXLl61A6Oq2abRAqt11Zdn7EYkh4qIJxcUuHcAnMPmZsO1v+UIUJ9stek7jnta4YVqfGnjabOFvSFnzWz/b3fmacDqxCBLJned1kN2I/JebTGy+l+SyZHT1R47JLXGdf0zeMLlyK4d8ehE8cDxCsipfmhhaDtB8NvIH0/bKOwYgqIsQSw9qGRwpMVsEVfCncudj0xpAjUCp54nbNif47DdcpGGA7sp4qNQAvMndq40D26NRKctjSwJt/6k2Nu1TkSNHpTnWCthSpeuUy7WrJJejJPL96NWT/bUvWu1r5eDLDwsW1yMC/VLXyC7KMyPbHdOJKjDywqI7c6OtNrGofJfqJ+Vslr8udimQTgUFAwxnmP3erBmQBII5B96w+wZo13V5ojdamJPbPLXiVoSu6uU3vpSFu/g1Tors+/7cbhjmg6NzltivuLLQWS0WODFqm2hd8yFUtURAvdnBSDw5dAHB55ZKFow+NemJjye+5lxmRJFPVyVe98fDkDKStH2ikIp6+HJK5fQLBzHftoBDW60Tuew/ekwPGEj/wyBrbiP93J3HzeyErxEAEGpOtURnTNBb7CRHtnHLNOG62FxB09Q1tZcjKCfacm8/t+B4M+6PYOP8t+mghsmx38Q9YBBASprRV6YvW+i5/3JH29EQ2BG1l06ERXtzYI/CPok7lagaUFnUVc9p79Wyvn8Qj7SwF4M1hnumAvHu5BkUrOuN37bjtgc62Yt8ObE/68VgGxX11XdrXY1XDvI6lLG5at6Nnx+zSduk5PLMJ9vuKnHa4h2DwiJgtCSEjoe6fBydzhPqMy3qBjJA2pM/3BoJr0ImZkYUruNqVR9wgaEbRNWOT6NtwlQ396Ot42JPfYfS52TeE9Jbmwx2uD+rxsR+3XW7BKw8M+uyKgUpI2+U9s0DLVw6KESkbQAd9nOimBreM4qSb5xjrKF0xBZB8+JL+bthbdBNPV2nf8rHapb/Zc+/z+B3CWzslEGwzRdsDjKGsOs/D0am59LZlQ/GRWaAInw76BI4ipkvs6uLdWjieTopVgstzXCs9KeD/VJSEgFnOOLB+AgyjOYuJsEdf5E9FapMjxs96NRFEfoiSK3ykQPAh7vFR2O1GFpkCxNZWnN9IRKklFoMcnto8/pUf+40LG9copuQtmXL5VJ1IusgXAI4x9jqnTBMFRqSGrvWQViyjWFnoUiEKYz7mnAPvaK+E6ceF3bFTSia3ykIV04VUW7OVNc/JTssJrQbB3mx6YhnyOqdlIrgS5BkqmzwlHF7UK8TIY0GKaV8qn4K8Wt9ZRS2djXTRpBdqFkbvetYu2AsrjvxChJUhT9XNe5K/8R6/aT0jYs+jHpBA6LC2omZbF//DPRjBjk8cYPq4Jg+k4nF06m863zCCZ6YZxjBMR29TObJ86iOBaAfJcFUK2cOts0HV7AyI8dmJ2ZzuZiIS9HotZzw0IpP8RpgieyJuUTbfRyWHfXpn0lIkPPeIviGfkY1gXDIgZOoGkyA6BC3HHXU+obhMoRU6I7OLVoUTA73aZjOrRwx4JZRz7vAmb9RM1XJQOMVYp1bInmtyYMDT0BF7pvk1ApDrY3+hhoGuIdq4Ayxz3eBx2dvpxp1s4JPLknk0eCBt1dFOHJYwOXRJfaFP2zTqFnZDK/nKUuFr4mQLK0qFWKHUiKPZtEwDmCcCuBGTyNcy7cFUI1WVcdVu3rUChdfvSiPDAyflM2u2yWbWl03G7QbRx3M8bq6IJVHYFhvGhTeRJesnugC6ok0GtI8InmOsFMYU/8aZ4X/m22y4XSEHs8oYaG4PKY8M0lcCHTpFn6BMgCwqIoha9Av/kxPGwWTvtFb2mnodmNX26Qcv4jVhoAtIkliYY2rl92h6ZMMo09hhT0gdnhUKIS6+INKzba4vwyAn89lYk7PeZjDqsaK0+i6mS2Qr7baYHQ+Xdd+t5z+k8QXyYbQ36/joTLygISt2kGsP0H4mT84m42yUbGI/I+nEvb1Tl837dKpVIYjoYmFuzqqXIRDhRhMv8XJ2z0bDbQbyn3MbYUVR3BR36MqC0oEJkSt0C2N8mYMYnTXixLhgw272YjPs9V9tShrHNmwtOq/LjIyrexF9nfGUC0wsLmH0h0SJbxyGjS2cETyN3JtA8UadWOznMtvLSG7qUfeqVecbJQK/3Qn5z7l61on8dN1OxaDDgcdttzFR3CcvgsXtHjuzX87EjLNLKRAcb0wLRNgFmsT3j5X5PM0ZfLEfVpH49yF2YDs9nDZXf61B+veyQdgRefx7Ne8o/WpvIcrHFwFUqy+pLIypJN1QIqtzEQbJjh1L2qeX+Sp++Hg+b9Xw2GnY7daXyTsnPTl/O6xVZ0ULPZPE+CjaWf72nMebPd7TGsvR7Ih8bTgp/qJRl5AsBLaE3FDAV7lQQKnWPbkGGMmPNje135RUg7enJ1XI6GfTbjmza0KSux4NWo24+AIEV4aZwDzd8qm6tnpNG0DSebS5Ek1OntX0eawJsCOz3mybbIemWJa+2okUYaQXZa8+Z1WKBzxyCcZeTnrw6aC+9VismRaj2683kftGX+fPI+JnlOoiHyZhpNu+27U6n0bBePp8cmsAmXWrX37OS0aBmmCXKvJ86X69MtczTOSsXGd3pfgPsJnzGxO2RrwbRnRp15rmdaG2b2gDOKb671eBOxr/GfXe88brisnBVCEMdlupUVri4kBUlZ1tx9OUW7SI8e22VXZ6elEsBjrxEyWzidMulIcNbPFJ+8h8cUep4k3wdeWUC9YUFNH95RivIGCMfUmEpvMJV+BGVWn0ENaF2iyPSozNCyiidYXD8U7epW2u4NkJ1zNHPgeOKVL2FFkqlW9yYCE+B00/LpMHX+frRIZ/X6fDfxmFm+YMet4tUfTqy8EL1qEdHwIfwzgAbB+uMgvGIMEEFqgcZyhwBqgGGnISxaK8iJCZu0WrfcjrslkpUrwQ6KIAy8f9FAc6tW5I7ipvMVTJbiUjAbtazE4fNYjLIW8i9TP5PhahAV7tcd9PQyflq9WinXRFq3xDDP07YaaCNg9oEXwO6GzHUQI8s3IbGwxrXjESb3GgJJnXXqHsWsVM6udFuDJVWHJ12CzJCz6nFVDIa4TSOzdq8Bz7ClX/O+3VTJPu1UjTotRhwa7yTFTrcwzTU39GByktcCxMhbtT7dxqMIdVvVd1q5ZPFOH3P3sejXjc41uRhp2PkVopqGAfzSRqUNs1DO9dIMkWeMzLt1E2rdjZI2cReLcWIolDPyTCMp6yMo6U5C/N8Sss8TxmrhQhcWworAx2WpjavWGFOWvEXi7AMcDXw5/TixCeRf3eoCZ5ovhb1il5jb0WnEUW8sCXkwrz/k9dMoiygc5hVHtCNo/LkyqwlocVCSP7H7zeprChHmIgi47llIzWIziGaNJ7I/5Ow9hRl9xBNA7dU3HIXVT+T4EjuBMRDOrW6qxwgUpJrWNVcs12Rw/O2qqxoobiuoBFuM/Xudj0ekGuEkJdHqLGtS7wf80LNyBorAfbgjhuROHUye+IpQcDYZY5Tjex3qy51Rw9JbbURKtOhdwPUx5St4b1dsJFgi0eSdBC1KSw6hRPGwA3MMQDUXK17FxpHSNCFO+R0MuHFPFaLQc9OT788GaPO+dQcR0Twq6KQphIZNHx+kAX0xmqeqn16GGajQ7/mOcgbjTMNd5EtCRoko0pnxMDj0G3ciApTh1CF3WfS4BwoxQXcn3N6OZ9L75g/0bn9yjfuwIobTQsZLS5TghhubA4hl6kbJG0EEDFC8r3miJVJ8PKa5oOsKIEOeFq6rWTSg4JbZezXqIszAWb4kHBv9RdVPZ/SfnPkad6Jmv5EO0HOUyRoSLQTCUhumdNmfo5+VocPZNUtHLEJb1JUVSuuPUCw1YkJXBYKobuv8TmnlWt/KdcXXzHCEy7BUO8CdiWuzKcsgstnl/RsPeUt6U6+3AFYxvcrAv1qEzHoGJAyZuqyYytAnQybyvfPZzFL+x3KkPVM6KU9tU1Jd+4UpSWG9+tu2YjqvqWFyFpf1ejIeNTraiVGFJR7VN4jbB/KTKMIaFhPC5HEt+xTk6u32I0OtZcIX2Pv9ONSGelz0CEuaHui5TiLeUqs3//WGUkmgsXSGGhuNXxKKFq0il1WUISlAIHoIBtYr2bT4aDTngurXVtv/2qWhDiMDtNiY1toWW2s9V0YKEZyRSFm9N9GItxpBqobsJh7Ml7aQigdJrshPtiu8jn2FH7QA7IpRGspbllUZSZQiYGrMdHFxqWIbOZxIxKlaeIA1M71YitaxZVW9MkFhi1AUTFE7hL21fKx43ZZGZnFkvPaNeC9t2pyYp3pBeyeEs+dV8qlYjYTpx3Zd2srqt8BOjQLaLGZ8ckpMfM+ociAXMcK7PiI57oH++mdSShmavdcrWSybzkjpoRhHJdGhxbBl+cFmtgwKAogXW5kFNwlj2vG5rOGr3JiPfYZTiUZ0rFtMC7Sk5hGiU8XRS35sxk+s54PTg3S/p9l7OD07aZbyls9WluAMB16xF7hH2xVeEbiCawi7joJVnQTHT6aHxkBe0T3GSgsji7pySM8OBE31bVSXUYdof/ZaiSt6BPvY5yHJyAlhZ5c5Fi9BgQdjoP11wdQKMf5020O5e7VVkVDTXuPVJQbVLqJk8iZOiLDiWHI7d3jmohdAqCuEevtWty0rpga4cnVzXgsFEydOMtQi3nGhGUeplWBwE0ChMsP20MS3UIUJ8f+ZZrFZLDjyRc4oG6d3KsNDJqmnYSUlE4BVEEnwjpkmROC2t1mcVi/EpT1PfdKqGz1AeJgitVcZYt4I021/tY2EY1nEx/IEU0hF8UDVzZH3HYJpcyFKjE0nFr1ncBLjDLrsQ/NFsDcHNM1XfGvhm8xbztEGR2PfZyQfPj272tvxoBcXjQvmvRt11NB/bp4EhI6zfyJvqn2nvv3sVfnH9CedCyaeTUv72HaUEmK2jLOKdWiwHXrGtgbd18VIqvUEzJT9+OJNJhFyZL5v6UabUWr2GkFJf0/JiAikRCawH8OBTvXJ8mN0DiBzg6eNi3efIONnjdfhIwk49Em8yRfYobFbDcewD9lxVzG+mSaNDuRtLXisnRVCL29fdtI04qVmDbxFjSrmiipzhQTtMWIG/8QlL45mgRiBE9oZpwPGYbFFHVxmssmNN6Y6N8qW/G9a+QKCtHDg0k5KEaTmqiOLu9Ws4DFhoyLsyofjEhLBX7RFSdDahoD+pTDo6FWUngwiFJu0gmkuUXHQPfqzLwQxUv4SimyBRmmx08ud54VYjbCdJ3tpRWb2Kz7va53jN6JhfRsS083/bt0Dqy+NjK/XGZ5vA+qC4WYCq8QJTHFbWqlfsq2GDu2UMXJ7N+cPpdi1MZ4EvXfnmwS90Zf5ROJCHEIia6rKLe8NgYlUycBN3HDjrOvS6UQeKNTa4yZfn3V8Ruamq+T5EUjx2Tcr4QlhA4mYULI062gElRKwtfxxRl+feXKE1HFR7gKSigvy+Ftt11L2lno37ei9BMjSpgtOUFMzqyaUEig+oJywEyrC7v61awpGiXb6aLDMoWGS5+2dNoZmTmBK3WIvDae3kHAJMwK5zbTODU1WRIYbFURffFXfDOPYTSFs4hfTUWrx7gG2A2djQxRT8ydUsLwvK3PpKyxRef3edtlER6yFacgir9IE/erVH25zsZLt5GgjD+JjOmIKbFb7yPAXSQx49/0xGNv49TzrRlIOhPosAPWPrdJ2XFCZU2prEBT6MxZHGEe3aedB5p7I3ZkMuMts5AklP+ndamyohzhgf3RHENaPTpzl0hmj07UfL/IM20eGw2yJKARzaDODM1ZuyuDrGT9jeQtG6VnA0xL2CCPQamL2m3LOyQDUOiF3YmSFBVguK9dlceYyILB1bwzoMXQelwkcQ01tSph1gGCHediFOKHx2pQS4Ww+q8FqYGxx6vt3lMtlcpKiHqcKZAo0kmop3Za28Yss0Czn7ssFTP3cUBd0UIJXUFL31DzpGlWC7uMbJEj+sGpCrNyCEfQbmWnYaA2dBMp8UjcqTU7nR1HreMlQcdmbd6Dbm7SOJdi7QuSvbcTSBaXFGLIyoLrqs2GrFm12nFXneR+e51dc6VJs6nkKDpdG7h2Yies/m4vbmy8d8hELkBQiebAwNKGq5TG8oiWyqCGm1QJg5kzTWKSvlAT5ZSO84VHw9wPC0MHJR5kxVFvt6BkyXP+Qb1WKhZO3UQ8HDqe1NAjZVVzlas1mISC6NAtLERubSM0vi1J5V/n6uVol+de3XsOSGRIriRH8i0GddPuVpkAwXeIinjdZOQb81D7DcC5dGdfxeKwcMvpYYnAoMS3o2t4HRHQX9lVyhuz1ru3H9g7L8Db7oqQalrqGRXRRxDobziKeel+iJcl8naZM3FLIf6vG6zqCt+XqdyiEOFexc2UzmbSCG7VT+x787i34YmfQy81eH5NhafNV2FQefVufnYJ1AN314Uhx7TwHbQJ1LMyI6c5b6ocRkw45sR09Cv3OZp5u6mpBlO14yddnPGYfroQRnst0aa94qRA1BWjEZYXyf4Of9FBv90qi+T8+GhvV97kdKAjotNVsM9/YvjoMmjDWLFMyf9J/P8uyEtoHdNgrIXGc5UEXNDYRUq+jhs8GLDeJcqEcqRiyjr12kIuiMQxL3nJvfhy4rC7JRv9G+52Ct3+br94IWTTL57HQ36AUh3LipMOoSvaR7G2uPrxez2Ph9WyQM2zLlST/VrJE8m1ei83pf1bxv8qiPX3xmXBfQ25n631AhY84m5GvzonLE9uXJmoeqk9yZrbkbaJ7ehzbAzfvI2IPlhKJvcL0vPCoG2gXlcL254yXz71Qe5lQOwPUc/jYe4m/4l8i3IUa0Ad/xeMR512dOqCpp+WYYdWaNXQudwAcVHhxgslxHoLE02uAzWqraMgpW/b3LMMqdIV2UFIez0eWKgA32+HdJ6UpgPg6mGj6KITCiNZS0Y12Njslo+QeZTOBN60uHMB0nwHd848AlRFko3zTCc+kgmBaJX6XHneWEGuu4kaWRGsfnEnXOKHO0KAHGGhHsHDmiqgG3Lx7yqeHAIL//NxmtCRrQdr6h6FeezdzsMcWPOIJvwBJno0S1o1zFoSjLj8dWOTf3doXqGiXxTQsd65Eo9tIW7TKhqBOfIeuVxcgdyGEqkovuu0pzwzq7rSzp4LSEoSNTxovyZTtrvIPoJnuxmPut5/9zljXuusYT56cuSPolc4poHdwnuy0xRTZpChuzK3lStw5HAoCB7ycFF54YxATXJ4SS1ab6xmyDtV5bTgCK+mR2AE9Bx4mDouN+EAYrCUUqfW9nd0V7saJ/sTOOw0/5xDBKh3rl6nImnitIdKg6OgkCe7PTPaZq0P3hQyn1Obnz/jPGxq7AEsQmdk7CTTppnCZmzh3xy+rnAjjCYGupVMEA+OUy9t2qDe6lFq1AVIpd+caYaMs0SsjRY1wOvgvQVZ0mGu++gNTKFpMnO+alduqEt3Y16x8l5jBT2wzko0kcjoorvmBQdfrslluVNKT6gdYor/gwN0l8U2wY2xUY+HPtyWkcSMChUNMYrnJuknRcEsuMr/ld/hn1YZc3gPnyve9WmOv5vHZpL3cctnlrErKR+wLGml0lYR8AzPnjKjQsDC31FB/jKzy9VZzDVCdxrDvR777RLFmkGg9a4VEl4gsBB3gwD6aBDBCeh5Vi3yqb7exRzNTlFTZ+Z8c6vzFjI8gcXlD1CC3GgZKQmlYpnggsJVpjAVOK5Gh5LYR6Vw2xJihHvdsOzua6itksO6GtwIKOVqbyfh/y13HKuF2lJCpBvWWRJWYWemXH7ugJQXcOeQIcsIFa1PrXU3qHSch2ZmlTIOlqUgSJ0bmIaSTO+vZqQ4T9mDX93UGNO/rlzVarzQavsrTPw3pizTMa4gN9Xs+SxsBk9x0Qk6FyYuYnNAG/SMzHM9+QLKToPiTidxbY9Tip/DpjbPi9rfkzka5PRN26esRYW4rQ2iafskPqBCevTASMYJnaLSQ9+qpL8GsVFNi3/7mUuNXHko3Wn5g6Ahh5a9XILWBA6yE2jDYM0nmCHw1AjL4cCumZGiyDQxwm7dHUA5Yhx+LwNoHKiry2m1jncbR3c+7bsFyAHs+gukfBnxs6dD7FfOgsizGZmCQee4ooQo6J4gjqMngq8tHPzpQij9z2MlseJ7D+IVyyI8RInM/cga8fz8f+ET51N9ye4GvelPGs3HXif2OKihNxYqpvsRBKItQRXUeueSIuRkqMoJCrMbIIw61YKLLGiaNTWEqCrHmctLZPGimnnrZ82cemdOnlQTvVytUB81XzGMqnKNmz5uUHz7ekLZg+XJd1JF8+dHYnIRFkboMGpP1lmwUbJ5BxcuwS+ymw1kUWE2nBLkAzPXbJWqf96ucnVzt8gF4hqRRTfE7lpdatevkxqq/+xh2uIcky86WgOkxht1E9tEdVOvPS0FVo4opR4z+R3G2XnOYHi2VcXXfjmXsGUoB8B3tFrjcm05SRSL9XtSKdmK0QhLziP7B9LDQXxxyEr5/ihBvzgZA2uttrANU6XTbjUb1a44viEL7eivgPMWDIIGsLjlW9pnNQrRqVDwQb5Wbej9P4mw0K6l/LWZAU26pJNcR/JW/cZAEnTkTiY6pRKsR5ubAwN5kkK/z3nemD3mja/+77d7d7P5Feenc6qmWF2BaDC4f7SM2D3hVogwIV/pCIjzewwwj57STs7waZEVuRWhmf/rrxRhgjRjakVhM3DF1r9xp21JsX7O8YTCJFfTwtF/ehoJUHDLP9xfkpz8b2r9HeAXz9S8CvDLpsH//8uBlLxkpIAYBUDw2wClZDq9ge9oU7/ffEnkLji9rxa2VFtfaFX/xW6RSymJhZZ+6uVM6ZZSai61TsSPKuKzIlmC8Y/gEM4Gh/CK+HkFnsKqGtEn7xG8nnxMVxNC8jFpma0w4zdh4xWLncl9sIR73t+eUx7zYT3P/z+wFIn0I+p3JH1NmrLdAbeCv8XzaAJcV9Ak7gBX4eedwnXVO5WEW96p9XvonYY636IZ/Dtawf+905GL5N8ZjwTSdb8lDEe3M/esWv10r5DLHwhkEqmUFAT2yJ89FJDL5J08e7Uin4bmdYf9Q5Wv7e0Lluv8Ab8nyh+Wy7hWKL3lRWm+vLKCOeHjc7Dq7T2ZSHL4YzeC9rBrY7OAUNVq37dA8i79vEKtKkCdLlLS4/prBBZiQRZCkyYUCnrAP2JWHncgjrjxlpYLab66z2cEh9UMGvEk+Y5+q0PgrsPqUec7OiPZMASU0onHpxml5Uh++0jKQlj2TtS1heOCC2TQKQs670//HtcpBfIHdVEpFu+nUyNfP+BF0T6OFMX6gp8Tu00OuCO6tv98148NArH64h3f7k1vi9wRvSX/8Uu7/beJ1d8tBYqurx3f73TTrrLVG0esDdbFOfVP3auMq1AcDd6b+Iq3i25k/rxFbtqz8lZ408oKjmNt23xiX4XEt4VjKyuXB2bp8t/vsats5Xd9BNdnnPHb34Yj76V5nMV8EwAAAA=='
     return f"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60><title>{T}</title><style>
@@ -899,6 +1064,22 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
   text-decoration:none;display:inline-flex;align-items:center;justify-content:center;
 }}
 .dash-toggle:hover{{color:var(--green-mid);border-color:var(--line);}}
+.view-tog,.mode-tog{{
+  display:inline-flex;flex-wrap:nowrap;gap:0;align-items:stretch;padding:0;
+  border:2px solid #5a3a00;border-radius:4px;background:#0a0a0a;overflow:hidden;
+}}
+.view-tog{{position:absolute;top:8px;left:10px;z-index:50;}}
+.mode-tog{{position:absolute;right:10px;bottom:8px;z-index:20;}}
+.view-tog .vtab,.mode-tog .mtab{{
+  appearance:none;cursor:pointer;border:0;border-right:1px solid #5a3a00;background:#0a0a0a;color:#9a7a30;
+  font:700 11px/1 ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;letter-spacing:.04em;
+  text-transform:uppercase;padding:4px 9px;text-align:center;white-space:nowrap;
+  text-decoration:none;display:inline-flex;align-items:center;justify-content:center;
+}}
+.view-tog .vtab:last-child,.mode-tog .mtab:last-child{{border-right:0;}}
+.view-tog .vtab:hover,.mode-tog .mtab:hover{{color:#c4a04a;background:#120e04;}}
+.view-tog .vtab.on,.mode-tog .mtab.on{{color:#1a1000;background:var(--warn);box-shadow:inset 0 0 5px rgba(255,255,255,.12);}}
+
 .hero .odo-lbl,.hero .odo{{white-space:nowrap;}}
 .range-delta{{display:none;}}
 .range-delta.show{{display:block;text-align:center;font-size:11px;font-weight:800;letter-spacing:.03em;
@@ -932,18 +1113,15 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 }}
 .hero .range-tog{{
   position:absolute;top:8px;right:10px;z-index:50;pointer-events:auto;
+  flex-wrap:wrap;justify-content:flex-end;
+  max-width:min(52vw,calc(100% - 150px));
 }}
 .hero .range-tog .rtab{{
   position:relative;z-index:1;pointer-events:auto;
-  font-size:12px;padding:3px 8px;border-radius:3px;
+  font-size:10px;padding:2px 6px;border-radius:3px;
 }}
-.panel:has(.hof-grid) .dash-toggle{{
-  font-size:12px;padding:3px 8px;border-radius:3px;
-  border:2px solid #5a3a00;color:#9a7a30;background:#0a0a0a;z-index:6;
-}}
-.panel:has(.hof-grid) .dash-toggle:hover{{
-  color:#c4a04a;border-color:#7a5a10;
-}}
+/* hof uses .mode-tog */
+
 .hero .odo-lbl,.hero .odo-unit{{font-size:clamp(12px,1.05vw,16px);color:var(--label);letter-spacing:.18em;font-weight:800;
   margin:0 0 clamp(2px,.2vh,4px);padding:0;line-height:1.2;position:relative;z-index:2;
   background:transparent;flex-shrink:0;pointer-events:none;}}
@@ -1082,10 +1260,14 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
   font-size:12px;padding:5px 9px;border-radius:4px;pointer-events:none;z-index:10000;}}
 .foot{{text-align:center;color:var(--muted);font-size:clamp(11px,.85vw,13px);letter-spacing:.04em;flex-shrink:0;}}
 .bill-grid{{grid-template-columns:repeat(auto-fit,minmax(min(180px,100%),1fr));height:auto;align-content:stretch;}}
-.card.bill{{justify-content:center;padding:clamp(5px,.4vh,9px) clamp(6px,.5vw,9px);overflow:hidden;}}
+.card.bill{{justify-content:center;padding:clamp(5px,.4vh,9px) clamp(6px,.5vw,9px);overflow:visible;}}
 .bill-row{{display:flex;align-items:center;gap:clamp(5px,.45vw,9px);min-width:0;width:100%;}}
+.bill-amt{{display:inline-flex;align-items:baseline;gap:0;flex:0 0 auto;overflow:visible;}}
+.bill-cur{{font-family:var(--dseg);font-weight:700;font-style:italic;color:var(--green-bright);
+  font-size:clamp(13px,1.45vw,22px);letter-spacing:.02em;margin-right:.1em;
+  text-shadow:0 0 3px rgba(57,255,20,.8);line-height:1.35;}}
 .bill-row .big{{flex:0 0 auto;margin:0;font-size:clamp(13px,1.45vw,22px);}}
-.bill-row .big.dseg{{padding:.12em .08em .14em;margin:0;line-height:1.35;}}
+.bill-row .big.dseg,.bill-amt .big.dseg{{padding:.12em .1em .14em;margin:0;line-height:1.35;overflow:visible;}}
 .bill-meta{{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px;justify-content:center;}}
 .bill-meta .lbl{{white-space:normal;overflow:hidden;text-overflow:ellipsis;margin:0;font-size:clamp(9px,.8vw,12px);line-height:1.2;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}}
@@ -1116,6 +1298,10 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
 <div class=tagline>Every token counted by the proxy on port {PROXY_PORT} is a token the cloud will never bill you for. Last carnage report: {datetime.now():%b %d %H:%M}.</div>
 
 <div class=hero>
+  <div class="view-tog" aria-label="Desktop or mobile">
+    <a class="vtab on" href="/" title="Desktop view">DESKTOP</a>
+    <a class="vtab" href="/m" title="Mobile view">MOBILE</a>
+  </div>
   <nav class="range-tog" role="tablist" aria-label="Time range">{range_tabs}</nav>
   <div class=odo-lbl id=hero-lbl>TOTAL TOKENS ANNIHILATED</div>
   <div class="odo dseg seg" id=hero-odo data-val="{fmt(tot)}" data-ghost="{ghost_digits(fmt(tot))}">{fmt(tot)}</div>
@@ -1163,17 +1349,20 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
 <div class=panel>
   <h2>Hall of fame: hungriest models</h2>
   <div class="grid hof-grid">{modrows}</div>
-  <a class="dash-toggle rtab rtab-link" href="/cloud" title="Cloud usage">CLOUD</a>
+  <div class="mode-tog" aria-label="Local or cloud">
+    <a class="mtab on" href="/" title="Local annihilator">LOCAL</a>
+    <a class="mtab" href="/cloud" title="Cloud usage">CLOUD</a>
+  </div>
 </div>
 
-<p class=foot>No GPUs were harmed. Several cloud invoices were. · <a href="/m" style="color:var(--muted);text-decoration:underline">Mobile</a></p>
+<p class=foot>No GPUs were harmed. Several cloud invoices were.</p>
 </div>
 <script>var t=document.getElementById('tip');document.querySelectorAll('rect[data-t]').forEach(function(r){{r.onmousemove=function(e){{t.textContent=r.dataset.t;t.style.display='block';t.style.left=(e.clientX+12)+'px';t.style.top=(e.clientY+12)+'px'}};r.onmouseleave=function(){{t.style.display='none'}}}});</script>
 <script>(function(){{
 var KEY='tad-range2';
 var HOFKEY='tad-hof-slot4';
 var active=localStorage.getItem(KEY)||'all';
-if(['all','dod','mtd','weekly','monthly','yearly'].indexOf(active)<0) active='all';
+if(['all','today','dod','mtd','weekly','monthly','yearly'].indexOf(active)<0) active='all';
 function $(id){{return document.getElementById(id);}}
 function setDseg(el, text){{
   if(!el) return;
@@ -1299,12 +1488,14 @@ def page_mobile():
             continue
         v = tin / 1e6 * p["input_per_mtok"] + tout / 1e6 * p["output_per_mtok"]
         mv = money(v)
+        mv_num = mv[1:] if mv.startswith("$") else mv
         sav += (
             "<div class='card bill'><div class=bill-row>"
-            "<div class='big dseg seg' data-val='%s' data-ghost='%s'>%s</div>"
+            "<div class='bill-amt'><span class='bill-cur'>$</span>"
+            "<span class='big dseg seg' data-val='%s' data-ghost='%s'>%s</span></div>"
             "<div class=bill-meta><div class=lbl title='%s'>Kept from %s</div>"
             "<div class=muted>$%s/$%s per M in/out</div></div></div></div>"
-            % (mv, ghost_digits(mv), mv, html.escape(p["label"], quote=True), html.escape(p["label"]),
+            % (mv_num, ghost_digits(mv_num), mv_num, html.escape(p["label"], quote=True), html.escape(p["label"]),
                p["input_per_mtok"], p["output_per_mtok"])
         )
 
@@ -1362,6 +1553,7 @@ body::before{{content:"";pointer-events:none;position:fixed;inset:0;z-index:9999
   position:relative;
   width:100%;max-width:480px;margin:0 auto;display:flex;flex-direction:column;gap:12px;
   border:3px solid var(--line-strong);border-radius:12px;padding:12px 10px;
+  overflow-x:hidden;
   background:linear-gradient(180deg,#07100a,#030505);
   box-shadow:inset 0 0 24px #39ff1412,0 0 12px #39ff1420;
 }}
@@ -1382,11 +1574,11 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.06em;text-transform:upper
 .foot-bar .foot{{padding-top:0;margin:0;text-align:center;overflow-wrap:anywhere;}}
 .foot-bar .dash-toggle{{margin-left:auto;}}
 .wl-row{{display:flex;flex-wrap:wrap;gap:5px;}}
-.range-tog{{display:flex;flex-wrap:wrap;gap:3px;width:100%;padding:2px;border:1px solid var(--line-strong);
-  border-radius:4px;background:#040806;justify-content:center;margin-top:4px;}}
+.range-tog{{display:flex;flex-wrap:wrap;gap:3px;width:100%;max-width:100%;padding:2px;border:1px solid var(--line-strong);
+  border-radius:4px;background:#040806;justify-content:center;margin-top:4px;overflow:hidden;}}
 .rtab{{appearance:none;cursor:pointer;border:1px solid #1a2e1a;background:#0a120c;color:#5a7a5a;
-  font:700 10px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;padding:6px 8px;border-radius:3px;
-  text-align:center;white-space:nowrap;text-decoration:none;flex:1 1 auto;min-width:44px;
+  font:700 10px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;padding:6px 7px;border-radius:3px;
+  text-align:center;white-space:nowrap;text-decoration:none;flex:1 1 auto;min-width:40px;
   display:inline-flex;align-items:center;justify-content:center;}}
 .rtab.on{{color:#041204;background:var(--green);border-color:var(--green-bright);}}
 .rtab.rtab-link{{color:var(--muted);flex:0 0 auto;}}
@@ -1475,8 +1667,11 @@ h2::before,h2::after{{content:"";flex:1;height:2px;background:linear-gradient(90
 .speed-unit{{font-size:12px;color:var(--muted);font-weight:800;letter-spacing:.08em;text-transform:uppercase;}}
 .bill-grid,.hof-grid{{display:flex;flex-direction:column;gap:8px;}}
 .bill-row{{display:flex;align-items:center;gap:8px;min-width:0;width:100%;}}
+.bill-amt{{display:inline-flex;align-items:baseline;overflow:visible;}}
+.bill-cur{{font-family:var(--dseg);font-weight:700;font-style:italic;color:var(--green-bright);
+  font-size:clamp(16px,5.5vw,22px);margin-right:.1em;text-shadow:0 0 3px rgba(57,255,20,.8);}}
 .bill-row .big{{flex:0 0 auto;margin:0;font-size:clamp(16px,5.5vw,22px);}}
-.bill-row .big.dseg{{padding:.12em .08em .14em;margin:0;line-height:1.35;}}
+.bill-row .big.dseg,.bill-amt .big.dseg{{padding:.12em .1em .14em;margin:0;line-height:1.35;overflow:visible;}}
 .bill-meta{{flex:1 1 auto;min-width:0;}}
 .bill-meta .lbl,.bill-meta .muted{{margin:0;}}
 .cal{{display:flex;flex-direction:column;gap:6px;width:100%;overflow:hidden;}}
@@ -1567,7 +1762,7 @@ h2::before,h2::after{{content:"";flex:1;height:2px;background:linear-gradient(90
 
 <div class="foot-bar">
 <p class=foot>No GPUs were harmed. Several cloud invoices were.</p>
-<a class="dash-toggle rtab rtab-link" href="/cloud/m" title="Cloud usage">CLOUD</a>
+<div class="mode-tog" aria-label="Local or cloud"><a class="mtab on" href="/m">LOCAL</a><a class="mtab" href="/cloud/m">CLOUD</a></div>
 </div>
 </div>
 <script>(function(){{
@@ -1606,7 +1801,7 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')closeTip();
 <script>(function(){{
 var KEY='tad-range2';
 var active=localStorage.getItem(KEY)||'all';
-if(['all','dod','mtd','weekly','monthly','yearly'].indexOf(active)<0) active='all';
+if(['all','today','dod','mtd','weekly','monthly','yearly'].indexOf(active)<0) active='all';
 function $(id){{return document.getElementById(id);}}
 function setDseg(el, text){{
   if(!el) return;
@@ -1647,9 +1842,33 @@ if(active!=='all') loadRange(active, true); else localStorage.setItem(KEY,'all')
 </body></html>"""
 
 
-def page_cloud(mobile=False):
+def page_cloud(mobile=False, range_key="all"):
     """Dedicated Cloud Usage dashboard (Codex/GPT, Grok Bot, OpenCode)."""
-    providers = load_cloud_providers()
+    rk = (range_key or "all").lower()
+    rk = RANGE_ALIASES.get(rk, rk)
+    if rk not in RANGES: rk = "all"
+    providers = load_cloud_providers(rk)
+    cov_bits = []
+    for _p in providers:
+        if _p.get("id") == "opencode":
+            cov_bits.append("OpenCode: real (%s) from local opencode.db" % RANGE_META.get(rk, (rk,))[0].lower())
+        elif _p.get("id") == "codex":
+            cov_bits.append("Codex: real today/week/all from session rollouts; other tabs approximate")
+        elif _p.get("id") == "grok":
+            cov_bits.append("Grok: current snapshot only; historical ranges filling via cloud_snapshots.jsonl")
+    range_cov = " · ".join(cov_bits)
+    range_tabs = range_tabs_html(rk, include_mobile=False)
+    if rk in ("today", "dod"):
+        for _p in providers:
+            if _p.get("id") == "codex":
+                _p["stats"] = [s for s in (_p.get("stats") or []) if s.get("label") == "Today tok"]
+            if _p.get("id") == "grok":
+                _p["note"] = ((_p.get("note") or "") + " · snapshot=current").strip(" ·")
+    elif rk not in ("all", "weekly"):
+        for _p in providers:
+            if _p.get("id") == "grok":
+                _p["note"] = ((_p.get("note") or "") + " · snapshot=current (filling)").strip(" ·")
+
     cards = render_cloud_usage_cards(providers, compact=bool(mobile), show_stats=True)
     cloud_tot, _codex_tot, _grok_tot = cloud_total_tokens()
     tot_s = fmt(cloud_tot)
@@ -1670,6 +1889,10 @@ def page_cloud(mobile=False):
         body_pad = "calc(14px + var(--safe-t)) calc(12px + var(--safe-r)) calc(64px + var(--safe-b)) calc(12px + var(--safe-l))"
         grid_cols = "1fr"
         cluster_max = "480px"
+        hero_tog_css = """.hero{padding-top:46px;}
+.hero .range-tog{position:static;display:flex;flex-wrap:wrap;justify-content:center;gap:2px;width:100%;max-width:100%;border:1px solid var(--line-strong);border-radius:4px;background:#040806;padding:2px;overflow:hidden;}
+.hero .range-tog .rtab{appearance:none;cursor:pointer;border:1px solid #1a2e1a;background:#0a120c;color:#5a7a5a;font:700 10px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;padding:3px 6px;border-radius:2px;text-decoration:none;display:inline-flex;flex:1 1 auto;min-width:40px;justify-content:center;white-space:nowrap;}
+.hero .range-tog .rtab.on{color:#041204;background:var(--green);border-color:var(--green-bright);}"""
     else:
         tog_css = """.dash-toggle{
   position:absolute;right:10px;bottom:8px;z-index:20;
@@ -1682,6 +1905,9 @@ def page_cloud(mobile=False):
         body_pad = "calc(14px + var(--safe-t)) calc(16px + var(--safe-r)) calc(52px + var(--safe-b)) calc(16px + var(--safe-l))"
         grid_cols = "repeat(3,minmax(0,1fr))"
         cluster_max = "1100px"
+        hero_tog_css = """.hero .range-tog{position:absolute;top:8px;right:10px;z-index:50;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:1px;max-width:min(52vw,calc(100% - 150px));border:1px solid var(--line-strong);border-radius:4px;background:#040806;padding:1px;}
+.hero .range-tog .rtab{appearance:none;cursor:pointer;border:1px solid #1a2e1a;background:#0a120c;color:#5a7a5a;font:700 10px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;padding:2px 6px;border-radius:2px;text-decoration:none;display:inline-flex;justify-content:center;white-space:nowrap;}
+.hero .range-tog .rtab.on{color:#041204;background:var(--green);border-color:var(--green-bright);}"""
 
     return f"""<!doctype html><html lang=en><head>
 <meta charset=utf-8>
@@ -1701,7 +1927,7 @@ def page_cloud(mobile=False):
   --safe-l:env(safe-area-inset-left,0px);--safe-r:env(safe-area-inset-right,0px);
 }}
 *{{box-sizing:border-box;margin:0;padding:0}}
-html,body{{width:100%;min-height:100%;background:var(--bg);color:var(--green);}}
+html,body{{width:100%;min-height:100%;background:var(--bg);color:var(--green);overflow-x:hidden;}}
 body{{
   font-family:var(--mono);font-size:15px;line-height:1.35;
   padding:{body_pad};
@@ -1712,6 +1938,7 @@ body::before{{content:"";pointer-events:none;position:fixed;inset:0;z-index:9999
   position:relative;
   width:100%;max-width:{cluster_max};margin:0 auto;display:flex;flex-direction:column;gap:14px;
   border:3px solid var(--line-strong);border-radius:12px;padding:16px 14px;
+  overflow-x:hidden;
   background:linear-gradient(180deg,#07100a,#030505);
   box-shadow:inset 0 0 24px #39ff1412,0 0 12px #39ff1420;
 }}
@@ -1737,7 +1964,7 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
   display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:clamp(4px,.4vh,8px);
   padding:clamp(10px,1vh,16px) clamp(8px,.8vh,14px) clamp(6px,.6vh,12px);
   border:3px solid var(--line-strong);border-radius:10px;background:#050a07;
-  box-shadow:inset 0 0 18px #39ff1418;overflow:visible;flex-shrink:0;
+  box-shadow:inset 0 0 18px #39ff1418;overflow:hidden;flex-shrink:0;
 }}
 .odo-lbl{{font-size:12px;color:var(--label);letter-spacing:.14em;font-weight:800;text-align:center;}}
 .odo{{white-space:nowrap;}}
@@ -1803,6 +2030,17 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
   text-transform:uppercase;padding:18px 0;text-align:center;
 }}
 .cluse-card.status-not_linked{{opacity:.72;}}
+.bot-av{{display:inline-block;vertical-align:middle;margin-right:4px;}}
+.cluse-meter-hd .lbl{{display:inline-flex;align-items:center;gap:4px;}}
+.range-cov{{font-size:11px;color:var(--muted);letter-spacing:.03em;margin:0 0 8px;line-height:1.35;}}
+.view-tog,.mode-tog{{display:inline-flex;gap:0;border:2px solid #5a3a00;border-radius:4px;background:#0a0a0a;overflow:hidden;}}
+.view-tog{{position:absolute;top:8px;left:10px;z-index:50;}}
+.mode-tog{{position:absolute;right:10px;bottom:8px;z-index:20;}}
+.view-tog .vtab,.mode-tog .mtab{{border:0;border-right:1px solid #5a3a00;background:#0a0a0a;color:#9a7a30;font:700 11px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;padding:4px 9px;text-decoration:none;display:inline-flex;align-items:center;}}
+.view-tog .vtab:last-child,.mode-tog .mtab:last-child{{border-right:0;}}
+.view-tog .vtab.on,.mode-tog .mtab.on{{color:#1a1000;background:var(--warn);}}
+{hero_tog_css}
+
 .cluse-card.status-awaiting .cluse-note{{color:var(--warn);}}
 .muted{{color:var(--muted);}}
 .foot{{text-align:center;color:var(--muted);font-size:12px;letter-spacing:.03em;padding-top:4px;}}
@@ -1813,22 +2051,341 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 </div>
 <div class=tagline>Non-Spark cloud spend and quota · Codex / GPT · Grok Bot · OpenCode · refreshed {datetime.now():%b %d %H:%M}.</div>
 <div class=hero>
+  <div class="view-tog" aria-label="Desktop or mobile">
+    <a class="vtab{" on" if not mobile else ""}" href="/cloud" title="Desktop cloud">DESKTOP</a>
+    <a class="vtab{" on" if mobile else ""}" href="/cloud/m" title="Mobile cloud">MOBILE</a>
+  </div>
+  <nav class="range-tog" role="tablist" aria-label="Time range">{range_tabs}</nav>
   <div class=odo-lbl>TOTAL CLOUD TOKENS</div>
   <div class="odo dseg seg" id=hero-odo data-val="{tot_s}" data-ghost="{tot_ghost}">{tot_s}</div>
 </div>
 <div class="panel cluse">
   <h2>Cloud usage</h2>
+  <p class="range-cov">{range_cov}</p>
   <div class="cluse-grid">{cards}</div>
 </div>
 <p class=foot>Quota meters only — Token CEO does not pause queues.</p>
-<a class="dash-toggle rtab rtab-link" href="{back_href}" title="Local annihilator">{back_lbl}</a>
+<div class="mode-tog" aria-label="Local or cloud"><a class="mtab" href="{back_href}" title="Local annihilator">LOCAL</a><a class="mtab on" href="/cloud{"/m" if mobile else ""}" title="Cloud usage">CLOUD</a></div>
 </div>
+<script>(function(){{
+var tabs=document.querySelectorAll('.hero .range-tog .rtab[data-range]');
+tabs.forEach(function(btn){{
+  btn.addEventListener('click', function(){{
+    var r=btn.getAttribute('data-range')||'all';
+    var u=new URL(location.href);
+    if(r==='all') u.searchParams.delete('range'); else u.searchParams.set('range', r);
+    location.href=u.pathname+(u.search||'');
+  }});
+}});
+}})();</script>
 </body></html>"""
+
+
+
+
+# --- Office status feed (Tailscale-only; ring buffer, 12h TTL) ---
+OFFICE_TTL_SEC = 12 * 3600
+OFFICE_STATUSES = ("working", "done", "idle", "waiting_user", "error")
+_office_lock = threading.Lock()
+_office_cond = threading.Condition(_office_lock)
+_office_seq = 0
+_office_events = []  # [{id, ts, bot, status, step}]
+
+
+def _office_prune(now=None):
+    now = time.time() if now is None else now
+    cutoff = now - OFFICE_TTL_SEC
+    # keep in place under caller lock
+    i = 0
+    while i < len(_office_events):
+        if _office_events[i]["ts"] < cutoff:
+            del _office_events[i]
+        else:
+            i += 1
+
+
+def office_ingest(payload):
+    """Accept dict or plain text; return stored event or raise ValueError."""
+    global _office_seq
+    if isinstance(payload, str):
+        payload = payload.strip()
+        if not payload:
+            raise ValueError("empty body")
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            # ntfy-style plain: "bot|status|step" or just treat as step for unknown
+            parts = [p.strip() for p in payload.split("|", 2)]
+            if len(parts) >= 2:
+                data = {"bot": parts[0], "status": parts[1], "step": parts[2] if len(parts) > 2 else ""}
+            else:
+                raise ValueError("plain body must be bot|status|step or JSON")
+    elif isinstance(payload, dict):
+        data = payload
+    else:
+        raise ValueError("unsupported body")
+    bot = str(data.get("bot") or "").strip()
+    status = str(data.get("status") or "").strip().lower()
+    step = str(data.get("step") or "").strip()
+    if not bot:
+        raise ValueError("bot required")
+    if len(bot) > 64:
+        raise ValueError("bot name too long")
+    if status == "clear":
+        with _office_cond:
+            _office_events[:] = [e for e in _office_events if e["bot"] != bot]
+            _office_cond.notify_all()
+        return {"cleared": bot}
+    if status not in OFFICE_STATUSES:
+        raise ValueError("status must be one of: " + ", ".join(OFFICE_STATUSES))
+    if len(step) > 80:
+        step = step[:80]
+    now = time.time()
+    with _office_cond:
+        _office_prune(now)
+        _office_seq += 1
+        ev = {"id": _office_seq, "ts": now, "bot": bot, "status": status, "step": step}
+        _office_events.append(ev)
+        _office_cond.notify_all()
+        return dict(ev)
+
+
+def office_events_since(since_id=0, now=None):
+    now = time.time() if now is None else now
+    with _office_lock:
+        _office_prune(now)
+        return [dict(e) for e in _office_events if e["id"] > since_id]
+
+
+def office_latest(now=None):
+    now = time.time() if now is None else now
+    with _office_lock:
+        _office_prune(now)
+        latest = {}
+        for e in _office_events:
+            latest[e["bot"]] = dict(e)
+        return latest
+
+
+def office_json_payload(since_sec=None):
+    now = time.time()
+    latest = office_latest(now)
+    if since_sec is not None:
+        cutoff = now - since_sec
+        latest = {k: v for k, v in latest.items() if v["ts"] >= cutoff}
+    return {"now": now, "ttl_sec": OFFICE_TTL_SEC, "bots": latest}
+
+
+
+
+def office3d_root():
+    return Path(__file__).resolve().parent / "office3d"
+
+
+def office3d_safe_file(rel):
+    """Resolve a path under office3d/; return Path or None if escape/missing."""
+    root = office3d_root().resolve()
+    rel = (rel or "").lstrip("/")
+    if not rel or ".." in rel.split("/"):
+        return None
+    fp = (root / rel).resolve()
+    if not str(fp).startswith(str(root)):
+        return None
+    if not fp.is_file():
+        return None
+    return fp
+
+
+OFFICE3D_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".map": "application/json",
+}
+
+def page_office():
+    # Simple own page (not Bodila51). Dark tokens matching Token Annihilator.
+    return """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Office · Token Annihilator</title>
+<style>
+:root{--bg:#030505;--panel:#0a100c;--green:#39ff14;--green-bright:#c8ff9a;--muted:#a8d898;--label:#f0ffe8;
+--warn:#ffcc00;--redline:#ff3d1a;--cyan:#7ef0ff;--line:#1a3a22;--line-strong:#2a5a32;--waiting:#ff9f1a}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--green);
+font:14px/1.4 ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace}
+header{display:flex;align-items:baseline;gap:16px;padding:18px 22px 8px;border-bottom:2px solid var(--line-strong)}
+h1{margin:0;font-size:18px;letter-spacing:.12em;text-transform:uppercase;color:var(--green-bright)}
+.sub{color:var(--muted);font-size:12px}
+a{color:var(--muted)} a:hover{color:var(--green-bright)}
+main{padding:18px 22px 40px;display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
+.card{background:var(--panel);border:2px solid var(--line);border-radius:8px;padding:14px 16px;min-height:110px}
+.card.idle{opacity:.72}
+.name{font-size:15px;font-weight:800;color:var(--cyan);margin:0 0 8px;word-break:break-word}
+.chip{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;
+padding:3px 8px;border-radius:3px;border:1px solid;margin-bottom:10px}
+.chip.working{color:#041204;background:var(--green);border-color:var(--green-bright)}
+.chip.done{color:#041204;background:var(--green-bright);border-color:var(--green)}
+.chip.idle{color:var(--muted);background:#0a120c;border-color:var(--line)}
+.chip.waiting_user{color:#1a1000;background:var(--waiting);border-color:var(--warn)}
+.chip.error{color:#1a0500;background:var(--redline);border-color:var(--redline)}
+.step{color:var(--label);font-size:13px;min-height:2.6em;word-break:break-word}
+.age{color:var(--muted);font-size:11px;margin-top:10px}
+.empty{grid-column:1/-1;color:var(--muted);padding:24px 0}
+</style></head><body>
+<header>
+  <h1>Office</h1>
+  <span class="sub">live bot status · 12h · <a href="/">dashboard</a> · <a href="/m">mobile</a></span>
+</header>
+<main id="grid"><div class="empty">waiting for status…</div></main>
+<script>
+const grid = document.getElementById('grid');
+const bots = {};
+function age(ts){
+  const s = Math.max(0, Math.floor(Date.now()/1000 - ts));
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm ago';
+}
+function render(){
+  const names = Object.keys(bots).sort((a,b)=>a.localeCompare(b));
+  if (!names.length){ grid.innerHTML = '<div class="empty">no status in the last 12h</div>'; return; }
+  grid.innerHTML = names.map(n=>{
+    const e = bots[n];
+    return '<div class="card '+e.status+'"><div class="name">'+esc(e.bot)+'</div>'
+      +'<span class="chip '+e.status+'">'+esc(e.status)+'</span>'
+      +'<div class="step">'+esc(e.step||'—')+'</div>'
+      +'<div class="age" data-ts="'+e.ts+'">'+age(e.ts)+'</div></div>';
+  }).join('');
+}
+function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function apply(e){ if(!e||!e.bot) return; bots[e.bot]=e; render(); }
+function boot(snap){
+  Object.keys(bots).forEach(k=>delete bots[k]);
+  const map = (snap && snap.bots) || {};
+  Object.keys(map).forEach(k=>bots[k]=map[k]);
+  render();
+}
+fetch('/office/json').then(r=>r.json()).then(boot).catch(()=>{});
+const es = new EventSource('/office/events');
+es.addEventListener('status', ev=>{ try{ apply(JSON.parse(ev.data)); }catch(e){} });
+es.addEventListener('clear', ev=>{ try{ const d=JSON.parse(ev.data); delete bots[d.bot]; render(); }catch(e){} });
+es.onmessage = ev=>{ try{ apply(JSON.parse(ev.data)); }catch(e){} };
+setInterval(()=>{ document.querySelectorAll('.age[data-ts]').forEach(el=>{ el.textContent = age(+el.dataset.ts); }); }, 5000);
+</script></body></html>"""
 
 
 
 class Dash(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+
+    def _send(self, code, body, ctype, extra_headers=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _read_json_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return raw.decode("utf-8", errors="replace")
+
+    def do_POST(self):
+        path = (self.path or "/").split("?", 1)[0]
+        if path == "/office/status":
+            try:
+                payload = self._read_json_body()
+                ev = office_ingest(payload)
+                self._send(200, json.dumps(ev), "application/json; charset=utf-8")
+            except ValueError as e:
+                self._send(400, json.dumps({"error": str(e)}), "application/json; charset=utf-8")
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}), "application/json; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def do_DELETE(self):
+        path = (self.path or "/").split("?", 1)[0]
+        if path == "/office/status":
+            try:
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                bot = (qs.get("bot") or [""])[0].strip()
+                if not bot:
+                    body = self._read_json_body()
+                    if isinstance(body, dict):
+                        bot = str(body.get("bot") or "").strip()
+                if not bot:
+                    raise ValueError("bot required")
+                ev = office_ingest({"bot": bot, "status": "clear"})
+                self._send(200, json.dumps(ev), "application/json; charset=utf-8")
+            except ValueError as e:
+                self._send(400, json.dumps({"error": str(e)}), "application/json; charset=utf-8")
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}), "application/json; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _office_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        last_id = 0
+        # snapshot first
+        try:
+            for e in office_events_since(0):
+                last_id = max(last_id, e["id"])
+                line = "event: status\ndata: %s\n\n" % json.dumps(e)
+                self.wfile.write(line.encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        # stream new events up to ~10 minutes then let client reconnect
+        deadline = time.time() + 600
+        try:
+            while time.time() < deadline:
+                with _office_cond:
+                    _office_cond.wait(timeout=15)
+                    batch = [dict(e) for e in _office_events if e["id"] > last_id]
+                if not batch:
+                    try:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    continue
+                for e in batch:
+                    last_id = max(last_id, e["id"])
+                    line = "event: status\ndata: %s\n\n" % json.dumps(e)
+                    self.wfile.write(line.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def do_GET(self):
         path = (self.path or "/").split("?", 1)[0]
         font_map = {
@@ -1861,20 +2418,81 @@ class Dash(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers(); self.wfile.write(payload); return
+
+        if path == "/office3d" or path == "/office3d/":
+            fp = office3d_safe_file("index.html")
+            if fp is None:
+                self._send(404, b"office3d missing - generate index.html first", "text/plain; charset=utf-8"); return
+            b = fp.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
+        if path.startswith("/office3d/"):
+            rel = path[len("/office3d/"):]
+            fp = office3d_safe_file(rel)
+            if fp is None:
+                self._send(404, b"not found", "text/plain; charset=utf-8"); return
+            ctype = OFFICE3D_TYPES.get(fp.suffix.lower(), "application/octet-stream")
+            b = fp.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            if "/vendor/" in path:
+                self.send_header("Cache-Control", "public, max-age=86400")
+            else:
+                self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
+
+        if path == "/office" or path == "/office/":
+            try:
+                b = page_office().encode(); code = 200
+            except Exception as e:
+                b = ("error: %s" % e).encode(); code = 500
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
+        if path == "/office/json":
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            since = (qs.get("since") or [None])[0]
+            since_sec = None
+            if since:
+                m = re.match(r"^(\d+)(s|m|h)?$", since.strip())
+                if m:
+                    n = int(m.group(1))
+                    unit = m.group(2) or "s"
+                    since_sec = n * ({"s": 1, "m": 60, "h": 3600}[unit])
+            try:
+                payload = json.dumps(office_json_payload(since_sec)).encode()
+                code = 200
+            except Exception as e:
+                payload = json.dumps({"error": str(e)}).encode(); code = 500
+            self._send(code, payload, "application/json; charset=utf-8"); return
+        if path == "/office/events":
+            self._office_sse(); return
         try:
             if path in ("/m", "/mobile"):
                 b = page_mobile().encode(); code = 200
             elif path in ("/cloud/m", "/cloud/mobile"):
-                b = page_cloud(mobile=True).encode(); code = 200
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                rk = (qs.get("range") or ["all"])[0]
+                b = page_cloud(mobile=True, range_key=rk).encode(); code = 200
             elif path == "/cloud":
                 from urllib.parse import urlparse, parse_qs
                 qs = parse_qs(urlparse(self.path).query)
                 mob = (qs.get("m") or [""])[0] in ("1", "true", "yes")
-                b = page_cloud(mobile=mob).encode(); code = 200
+                rk = (qs.get("range") or ["all"])[0]
+                b = page_cloud(mobile=mob, range_key=rk).encode(); code = 200
             else:
                 b = page().encode(); code = 200
         except Exception as e: b = ("error: %s" % e).encode(); code = 500
         self.send_response(code); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
 
 class TS(ThreadingMixIn, http.server.HTTPServer): daemon_threads = True; allow_reuse_address = True
 
