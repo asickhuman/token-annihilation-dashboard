@@ -2316,6 +2316,89 @@ def office_latest(now=None):
         return latest
 
 
+def _codex_daily_deltas(days):
+    """Per-ET-day Codex tokens from rollout token_count events: delta of total_token_usage between events,
+    bucketed by event time. Returns (uncached, with_cached); uncached = input - cached_input + output."""
+    unc, raw = {}, {}
+    cutoff = time.time() - (len(days) + 1) * 86400
+    for root, _d, files in os.walk(CODEX_SESSIONS):
+        for name in files:
+            if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                continue
+            p = os.path.join(root, name)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    continue
+                prev = None
+                with open(p, errors="ignore") as f:
+                    for line in f:
+                        if "total_token_usage" not in line:
+                            continue
+                        try:
+                            o = json.loads(line)
+                            tu = ((o.get("payload") or {}).get("info") or {}).get("total_token_usage") or {}
+                            cur = (int(tu.get("input_tokens") or 0), int(tu.get("cached_input_tokens") or 0), int(tu.get("output_tokens") or 0))
+                            ts = datetime.fromisoformat(o["timestamp"].replace("Z", "+00:00")).astimezone().date().isoformat()
+                        except Exception:
+                            continue
+                        dlt = cur if (prev is None or cur[0] < prev[0]) else tuple(a - b for a, b in zip(cur, prev))
+                        prev = cur
+                        if ts in days:
+                            unc[ts] = unc.get(ts, 0) + max(0, dlt[0] - dlt[1]) + dlt[2]
+                            raw[ts] = raw.get(ts, 0) + dlt[0] + dlt[2]
+            except Exception:
+                continue
+    return unc, raw
+
+def office2d_tokens_payload(n=7):
+    """Read-only daily token series for /office2d finance screens. None = no data for that day."""
+    from datetime import timedelta
+    today = _today_et()
+    days = [(today - timedelta(days=i)).isoformat() for i in range(n - 1, -1, -1)]
+    local = None
+    try:
+        c = db()
+        try:
+            q = lambda sql, *a: c.execute(sql, a).fetchall()
+            rows = devastation_day_rows(q, "source='proxy'", n)
+        finally:
+            c.close()
+        m = {d: a + b for d, a, b in rows}
+        local = [m.get(d, 0) for d in days]
+    except Exception:
+        local = None
+    # cloud = Codex (max per-day "today" from cloud snapshots) + OpenCode cloud sessions (deepseek/other) per ET day.
+    try:
+        codex, codex_raw = _codex_daily_deltas(days)
+    except Exception:
+        codex, codex_raw = {}, {}
+    oc = {}
+    try:
+        import sqlite3 as _sq
+        if os.path.isfile(OPENCODE_DB):
+            _k, start_ms, _e = _opencode_range_bounds_ms("monthly")
+            con = _sq.connect("file:%s?mode=ro" % OPENCODE_DB, uri=True)
+            try:
+                rows = con.execute("SELECT model,time_created,COALESCE(tokens_input,0)+COALESCE(tokens_output,0)+COALESCE(tokens_reasoning,0) FROM session_v2 WHERE time_created>=?", (start_ms,)).fetchall()
+            finally:
+                con.close()
+            for raw, tc, tot in rows:
+                mid, pid = _opencode_model_parts(raw)
+                if _opencode_bucket(mid, pid) not in ("deepseek", "opencode-other"):
+                    continue
+                d = datetime.fromtimestamp(tc / 1000).date().isoformat()
+                if d in days:
+                    oc[d] = oc.get(d, 0) + int(tot or 0)
+    except Exception:
+        pass
+    cloud = [(codex[d] if d in codex else None) for d in days]
+    cloud = [None if (v is None and d not in oc) else (v or 0) + oc.get(d, 0) for v, d in zip(cloud, days)]
+    if all(v is None for v in cloud):
+        cloud = None
+    return {"days": days, "cloud": cloud, "local": local,
+            "cloud_sources": "codex per-day deltas from rollouts, cached input excluded + opencode cloud sessions; grok excluded (plan % only, no token counts)",
+            "codex_with_cached": [codex_raw.get(d) for d in days], "local_source": "stats.db requests source='proxy'", "now": time.time()}
+
 def office_json_payload(since_sec=None):
     now = time.time()
     latest = office_latest(now)
@@ -2594,6 +2677,22 @@ class Dash(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers(); self.wfile.write(b); return
 
+        if path == "/office2d/tokens.json":
+            b = json.dumps(office2d_tokens_payload()).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+        if path == "/office2d" or path.startswith("/office2d/"):
+            root = (Path(__file__).resolve().parent / "office2d").resolve()
+            rel = path[len("/office2d"):].lstrip("/") or "index.html"
+            fp = (root / rel).resolve()
+            if ".." in rel.split("/") or not str(fp).startswith(str(root)) or not fp.is_file():
+                self._send(404, b"not found", "text/plain; charset=utf-8"); return
+            ctype = {".html":"text/html; charset=utf-8",".js":"application/javascript; charset=utf-8",".ttf":"font/ttf",".css":"text/css"}.get(fp.suffix.lower(), "application/octet-stream")
+            b = fp.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "public, max-age=86400" if fp.suffix == ".ttf" else "no-store")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
         if path == "/office" or path == "/office/":
             try:
                 b = page_office().encode(); code = 200
