@@ -297,7 +297,7 @@ CLOUD_SNAP_JSONL = os.path.join(CLOUD_DIR, "cloud_snapshots.jsonl")
 
 BOT_AVATARS = {
     "Veil PM": ("#FF6700", "pumpkin"),
-    "dr eggbot": ("#111111", "teardrop"),
+    "dr eggbot": ("#F4F2EE", "teardrop"),
     "Zonk Bot": ("#9159FE", "cloud"),
     "Veil Assets": ("#FF309B", "flower"),
     "Veil Triage": ("#FF263C", "wedge"),
@@ -308,14 +308,25 @@ BOT_AVATARS = {
 def _bot_avatar_svg(name, size=28):
     color, shape = BOT_AVATARS.get(name, ("#888888", "hex"))
     c = html.escape(color, quote=True)
+    # Near-white / pastel fills need a soft outline so they read on light cards.
+    def _lum(hex_color):
+        h = hex_color.lstrip("#")
+        if len(h) != 6:
+            return 0.5
+        try:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        except Exception:
+            return 0.5
+        return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+    stroke_attr = ' stroke="#2a2a2a" stroke-width="1.35" stroke-opacity="0.55"' if _lum(color) >= 0.78 else ""
     paths = {
-        "pumpkin": '<ellipse cx="16" cy="18" rx="11" ry="9.5" fill="%s"/><rect x="14.5" y="6" width="3" height="4" rx="1" fill="#6b4a2a"/>' % c,
-        "teardrop": '<path d="M16 4 C24 14 24 21 16 28 C8 21 8 14 16 4 Z" fill="%s"/>' % c,
-        "cloud": '<circle cx="11" cy="18" r="5.5" fill="%s"/><circle cx="17" cy="15" r="7" fill="%s"/><circle cx="23" cy="18" r="5" fill="%s"/><rect x="9" y="18" width="16" height="6" rx="3" fill="%s"/>' % (c, c, c, c),
-        "flower": '<circle cx="16" cy="10" r="4.5" fill="%s"/><circle cx="16" cy="22" r="4.5" fill="%s"/><circle cx="10" cy="16" r="4.5" fill="%s"/><circle cx="22" cy="16" r="4.5" fill="%s"/><circle cx="16" cy="16" r="3.2" fill="%s"/>' % (c, c, c, c, c),
-        "wedge": '<path d="M16 5 L27 25 L5 25 Z" fill="%s"/>' % c,
-        "sparkle": '<path d="M16 3 L19 13 L29 16 L19 19 L16 29 L13 19 L3 16 L13 13 Z" fill="%s"/>' % c,
-        "hex": '<path d="M16 4 L27 10.5 L27 21.5 L16 28 L5 21.5 L5 10.5 Z" fill="%s"/>' % c,
+        "pumpkin": '<ellipse cx="16" cy="18" rx="11" ry="9.5" fill="%s"%s/><rect x="14.5" y="6" width="3" height="4" rx="1" fill="#6b4a2a"/>' % (c, stroke_attr),
+        "teardrop": '<path d="M16 4 C24 14 24 21 16 28 C8 21 8 14 16 4 Z" fill="%s"%s/>' % (c, stroke_attr),
+        "cloud": '<circle cx="11" cy="18" r="5.5" fill="%s"%s/><circle cx="17" cy="15" r="7" fill="%s"%s/><circle cx="23" cy="18" r="5" fill="%s"%s/><rect x="9" y="18" width="16" height="6" rx="3" fill="%s"%s/>' % (c, stroke_attr, c, stroke_attr, c, stroke_attr, c, stroke_attr),
+        "flower": '<circle cx="16" cy="10" r="4.5" fill="%s"%s/><circle cx="16" cy="22" r="4.5" fill="%s"%s/><circle cx="10" cy="16" r="4.5" fill="%s"%s/><circle cx="22" cy="16" r="4.5" fill="%s"%s/><circle cx="16" cy="16" r="3.2" fill="%s"%s/>' % (c, stroke_attr, c, stroke_attr, c, stroke_attr, c, stroke_attr, c, stroke_attr),
+        "wedge": '<path d="M16 5 L27 25 L5 25 Z" fill="%s"%s/>' % (c, stroke_attr),
+        "sparkle": '<path d="M16 3 L19 13 L29 16 L19 19 L16 29 L13 19 L3 16 L13 13 Z" fill="%s"%s/>' % (c, stroke_attr),
+        "hex": '<path d="M16 4 L27 10.5 L27 21.5 L16 28 L5 21.5 L5 10.5 Z" fill="%s"%s/>' % (c, stroke_attr),
     }
     body = paths.get(shape, paths["hex"])
     return '<svg class="bot-av" width="%d" height="%d" viewBox="0 0 32 32" aria-hidden="true">%s</svg>' % (size, size, body)
@@ -351,17 +362,35 @@ def _cloud_snapshot_log():
     except Exception:
         pass
 
-def _opencode_provider(range_key="all"):
-    """Live OpenCode usage from local SQLite (free local models)."""
-    import sqlite3
+def _opencode_model_parts(raw):
+    """Return (model_id, provider_id) from session_v2.model JSON/string. Never logs secrets."""
+    if not raw:
+        return ("", "")
+    try:
+        if isinstance(raw, str) and raw.startswith("{"):
+            o = json.loads(raw)
+            if isinstance(o, dict):
+                return (str(o.get("id") or ""), str(o.get("providerID") or o.get("provider") or ""))
+    except Exception:
+        pass
+    return (str(raw)[:64], "")
+
+
+def _opencode_bucket(model_id, provider_id):
+    """Classify OpenCode session: local spark, deepseek-cloud, or other-opencode-cloud."""
+    mid = (model_id or "").lower()
+    pid = (provider_id or "").lower()
+    if pid in ("spark-local", "spark-ollama") or mid.startswith("qwen") or "ollama" in pid:
+        return "local"
+    if "deepseek" in mid:
+        return "deepseek"
+    if pid == "opencode":
+        return "opencode-other"
+    return "other"
+
+
+def _opencode_range_bounds_ms(range_key="all"):
     from datetime import timedelta
-    path = OPENCODE_DB
-    if not os.path.isfile(path):
-        return {
-            "id": "opencode", "title": "OpenCode", "status": "not_linked",
-            "plan": "free · local", "meters": [], "stats": [],
-            "note": "missing ~/.local/share/opencode/opencode.db", "range_real": False,
-        }
     today = _today_et()
     def day_start_ms(d):
         try:
@@ -371,72 +400,135 @@ def _opencode_provider(range_key="all"):
             from datetime import timezone, timedelta as td
             dt = datetime(d.year, d.month, d.day, tzinfo=timezone(td(hours=-5)))
         return int(dt.timestamp() * 1000)
-
     key = (range_key or "all").lower()
     key = RANGE_ALIASES.get(key, key)
     if key not in ("all", "today", "dod", "mtd", "weekly", "monthly", "yearly"):
         key = "all"
     if key in ("today", "dod"):
-        start_ms, end_ms = day_start_ms(today), day_start_ms(today + timedelta(days=1))
-    elif key == "weekly":
-        start_ms, end_ms = day_start_ms(today - timedelta(days=6)), day_start_ms(today + timedelta(days=1))
-    elif key == "mtd":
-        start_ms, end_ms = day_start_ms(today.replace(day=1)), day_start_ms(today + timedelta(days=1))
-    elif key == "monthly":
-        start_ms, end_ms = day_start_ms(today - timedelta(days=29)), day_start_ms(today + timedelta(days=1))
-    elif key == "yearly":
-        start_ms, end_ms = day_start_ms(today.replace(month=1, day=1)), day_start_ms(today + timedelta(days=1))
-    else:
-        start_ms = end_ms = None
+        return key, day_start_ms(today), day_start_ms(today + timedelta(days=1))
+    if key == "weekly":
+        return key, day_start_ms(today - timedelta(days=6)), day_start_ms(today + timedelta(days=1))
+    if key == "mtd":
+        return key, day_start_ms(today.replace(day=1)), day_start_ms(today + timedelta(days=1))
+    if key == "monthly":
+        return key, day_start_ms(today - timedelta(days=29)), day_start_ms(today + timedelta(days=1))
+    if key == "yearly":
+        return key, day_start_ms(today.replace(month=1, day=1)), day_start_ms(today + timedelta(days=1))
+    return key, None, None
+
+
+def _opencode_agg(range_key="all", bucket="deepseek"):
+    """Sum tokens/sessions from opencode.db for a bucket. No credentials touched."""
+    import sqlite3
+    path = OPENCODE_DB
+    empty = {"ok": False, "tin": 0, "tout": 0, "treas": 0, "tot": 0, "n": 0,
+             "cost": 0.0, "top_model": "—", "note": "", "range_key": range_key}
+    if not os.path.isfile(path):
+        empty["note"] = "missing ~/.local/share/opencode/opencode.db"
+        return empty
+    key, start_ms, end_ms = _opencode_range_bounds_ms(range_key)
     try:
         con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
         try:
             if start_ms is None:
-                row = con.execute(
-                    "SELECT COALESCE(SUM(tokens_input),0),COALESCE(SUM(tokens_output),0),"
-                    "COALESCE(SUM(tokens_reasoning),0),COUNT(*) FROM session_v2"
-                ).fetchone()
-                models = con.execute(
-                    "SELECT model,COUNT(*),SUM(COALESCE(tokens_input,0)+COALESCE(tokens_output,0)) "
-                    "FROM session_v2 GROUP BY model ORDER BY 3 DESC LIMIT 5"
+                rows = con.execute(
+                    "SELECT model,COALESCE(tokens_input,0),COALESCE(tokens_output,0),"
+                    "COALESCE(tokens_reasoning,0),COALESCE(cost,0) FROM session_v2"
                 ).fetchall()
             else:
-                row = con.execute(
-                    "SELECT COALESCE(SUM(tokens_input),0),COALESCE(SUM(tokens_output),0),"
-                    "COALESCE(SUM(tokens_reasoning),0),COUNT(*) FROM session_v2 "
+                rows = con.execute(
+                    "SELECT model,COALESCE(tokens_input,0),COALESCE(tokens_output,0),"
+                    "COALESCE(tokens_reasoning,0),COALESCE(cost,0) FROM session_v2 "
                     "WHERE time_created>=? AND time_created<?", (start_ms, end_ms)
-                ).fetchone()
-                models = con.execute(
-                    "SELECT model,COUNT(*),SUM(COALESCE(tokens_input,0)+COALESCE(tokens_output,0)) "
-                    "FROM session_v2 WHERE time_created>=? AND time_created<? "
-                    "GROUP BY model ORDER BY 3 DESC LIMIT 5", (start_ms, end_ms)
                 ).fetchall()
         finally:
             con.close()
     except Exception as e:
-        return {
-            "id": "opencode", "title": "OpenCode", "status": "awaiting",
-            "plan": "free · local", "meters": [], "stats": [],
-            "note": "db error: %s" % e, "range_real": False,
-        }
-    tin, tout, treas, njobs = [int(x or 0) for x in row]
-    tot = tin + tout + treas
-    top_model = _opencode_model_label(models[0][0]) if models else "—"
-    pct = min(100.0, 100.0 * tot / 2_000_000.0) if key in ("today", "dod") else (100.0 if tot else 0.0)
+        empty["note"] = "db error: %s" % e
+        return empty
+    tin = tout = treas = n = 0
+    cost = 0.0
+    by_model = {}
+    for raw, a, b, c, cst in rows:
+        mid, pid = _opencode_model_parts(raw)
+        if _opencode_bucket(mid, pid) != bucket:
+            continue
+        a, b, c = int(a or 0), int(b or 0), int(c or 0)
+        tin += a; tout += b; treas += c; n += 1
+        try:
+            cost += float(cst or 0)
+        except Exception:
+            pass
+        by_model[mid or "?"] = by_model.get(mid or "?", 0) + a + b + c
+    top = max(by_model.items(), key=lambda kv: kv[1])[0] if by_model else "—"
     return {
-        "id": "opencode", "title": "OpenCode", "status": "live",
-        "plan": "free · local",
-        "meters": [{"label": "Local usage", "pct": pct,
-                    "detail": "model %s · free (local)" % top_model}],
+        "ok": True, "tin": tin, "tout": tout, "treas": treas,
+        "tot": tin + tout + treas, "n": n, "cost": cost,
+        "top_model": top, "note": "", "range_key": key,
+    }
+
+
+def _deepseek_via_opencode_provider(range_key="all"):
+    """Cloud card: DeepSeek traffic routed through OpenCode (from local session DB)."""
+    agg = _opencode_agg(range_key, bucket="deepseek")
+    if not agg["ok"] and "missing" in (agg.get("note") or ""):
+        return {
+            "id": "deepseek-opencode", "title": "DeepSeek (via OpenCode)",
+            "status": "not_linked", "plan": "via OpenCode",
+            "meters": [], "stats": [],
+            "note": "no data yet — need readable ~/.local/share/opencode/opencode.db",
+            "range_real": False,
+        }
+    if not agg["ok"]:
+        return {
+            "id": "deepseek-opencode", "title": "DeepSeek (via OpenCode)",
+            "status": "awaiting", "plan": "via OpenCode",
+            "meters": [], "stats": [],
+            "note": "no data yet — %s" % (agg.get("note") or "db unreadable"),
+            "range_real": False,
+        }
+    if agg["n"] == 0 and agg["tot"] == 0:
+        return {
+            "id": "deepseek-opencode", "title": "DeepSeek (via OpenCode)",
+            "status": "awaiting", "plan": "via OpenCode",
+            "meters": [], "stats": [],
+            "note": "no data yet — no DeepSeek sessions in opencode.db for this range",
+            "range_real": True, "range_key": agg["range_key"],
+        }
+    tot, n = agg["tot"], agg["n"]
+    key = agg["range_key"]
+    pct = min(100.0, 100.0 * tot / 2_000_000.0) if key in ("today", "dod") else (100.0 if tot else 0.0)
+    spend_note = (
+        "spend $0 in local logs (OpenCode free-tier cost field empty/zero; "
+        "paid DeepSeek API billing not present on disk)"
+        if agg["cost"] <= 0 else
+        ("spend $%.4f from session cost field" % agg["cost"])
+    )
+    return {
+        "id": "deepseek-opencode",
+        "title": "DeepSeek (via OpenCode)",
+        "status": "live",
+        "plan": "via OpenCode · free-tier logged",
+        "meters": [{
+            "label": "DeepSeek tokens",
+            "pct": pct,
+            "detail": "%s · %s sessions · %s" % (agg["top_model"], "{:,}".format(n), spend_note),
+        }],
         "stats": [
             {"label": "Tokens", "value": tot},
-            {"label": "Jobs", "value": njobs},
-            {"label": "In", "value": tin},
-            {"label": "Out", "value": tout},
+            {"label": "Sessions", "value": n},
+            {"label": "In", "value": agg["tin"]},
+            {"label": "Out", "value": agg["tout"]},
         ],
-        "note": "%s jobs · %s" % ("{:,}".format(njobs), top_model),
-        "range_real": True, "range_key": key, "top_model": top_model,
+        "note": "%s · reasoning %s · %s" % (
+            "{:,}".format(n) + " sessions", "{:,}".format(agg["treas"]), spend_note),
+        "range_real": True, "range_key": key, "top_model": agg["top_model"],
     }
+
+
+def _opencode_provider(range_key="all"):
+    """Back-compat: cloud uses DeepSeek split."""
+    return _deepseek_via_opencode_provider(range_key)
 
 
 def load_cloud_providers(range_key="all"):
@@ -557,8 +649,8 @@ def load_cloud_providers(range_key="all"):
             "note": "awaiting data",
         })
 
-    # 3) OpenCode — local models via opencode.db (free)
-    providers.append(_opencode_provider(range_key))
+    # 3) DeepSeek via OpenCode (cloud). Spark-local OpenCode usage lives on LOCAL.
+    providers.append(_deepseek_via_opencode_provider(range_key))
     return providers
 
 def render_cloud_usage_cards(providers, compact=False, show_stats=None):
@@ -895,6 +987,25 @@ def calendar(c):
         "<div class=legend><span class=leg-lbl>Mild</span> %s <span class=leg-lbl>Apocalyptic</span></div><div id=tip></div></div>"
     ) % (vb_w, vb_h, "".join(months), labels, "".join(cells), legend)
 
+
+def devastation_day_rows(q, where_clause, n=5):
+    """Exactly n calendar days ending today (ET): today + previous n-1. Missing days pad to 0."""
+    from datetime import timedelta
+    rows = q(
+        f"SELECT date(ts,'unixepoch','localtime') d, "
+        f"SUM(COALESCE(input_tokens,0)), SUM(COALESCE(output_tokens,0)) "
+        f"FROM requests WHERE {where_clause} GROUP BY d ORDER BY d DESC LIMIT ?",
+        n + 14,
+    )
+    by_day = {d: (int(a or 0), int(b or 0)) for d, a, b in rows}
+    today = _today_et()
+    out = []
+    for i in range(n):
+        d = (today - timedelta(days=i)).isoformat()
+        a, b = by_day.get(d, (0, 0))
+        out.append((d, a, b))
+    return out
+
 def months_join(m):
     return "".join(m)
 
@@ -903,7 +1014,7 @@ def page():
     P = "source='proxy'"
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COUNT(*) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
-    days = q(f"SELECT date(ts,'unixepoch','localtime') d, SUM(COALESCE(input_tokens,0)), SUM(COALESCE(output_tokens,0)) FROM requests WHERE {P} GROUP BY d ORDER BY d DESC LIMIT 8")
+    days = devastation_day_rows(q, P, 5)
     models = q(f"SELECT COALESCE(model,'?'), COUNT(*), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 40")
     cal = calendar(c); c.close()
     try: prices = json.load(open(PRICES))["models"]
@@ -937,6 +1048,16 @@ def page():
         "<tr><td colspan=4 class=muted>The silence before the storm. Point a client at port %d and let the carnage begin.</td></tr>" % PROXY_PORT
     )
     _tot = sum(t or 0 for _, _, t in models) or 1
+    # OpenCode → Spark local usage as a Hall of Fame entry (same card style).
+    # Tokens already flow through the proxy; do not inflate _tot.
+    try:
+        _oc = _opencode_agg("all", bucket="local")
+        if _oc.get("ok") and int(_oc.get("tot") or 0) > 0:
+            models = list(models) + [("OpenCode → Spark", int(_oc.get("n") or 0), int(_oc.get("tot") or 0))]
+            models.sort(key=lambda r: (r[2] or 0), reverse=True)
+            models = models[:40]
+    except Exception:
+        pass
     _medal = {0: "#1 legend", 1: "#2 champion", 2: "#3 master"}
     top3 = models[:3]
     rest = models[3:]
@@ -1008,6 +1129,7 @@ def page():
     range_tabs = range_tabs_html("all", include_mobile=False)
     T = "DGX Token Annihilator Dashboard"
     VFD_B64 = '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'
+
     return f"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60><title>{T}</title><style>
 @font-face{{font-family:"VFDPixel";src:url(data:font/woff2;base64,{VFD_B64}) format("woff2");font-weight:400;font-style:normal;font-display:swap;}}@font-face{{font-family:"DSEG7";src:url("/font/dseg7.woff2") format("woff2"),url("/font/dseg7.ttf") format("truetype");font-weight:700;font-style:italic;font-display:swap;}}
 :root{{
@@ -1027,11 +1149,14 @@ body::before{{content:"";pointer-events:none;position:fixed;inset:0;z-index:9999
   background:repeating-linear-gradient(0deg,rgba(0,0,0,.08) 0,rgba(0,0,0,.08) 1px,transparent 1px,transparent 3px);opacity:.16;}}
 .cluster{{
   position:relative;
+  --cluster-gap:clamp(5px,.5vh,8px);
+  --cluster-pad-y:clamp(8px,.7vh,12px);
+  --cluster-pad-x:clamp(10px,.85vw,14px);
   flex:1;min-height:0;width:100%;overflow:hidden;
-  display:grid;gap:clamp(5px,.5vh,8px);
+  display:grid;gap:var(--cluster-gap);
   grid-template-rows:auto auto auto minmax(0,1fr) minmax(0,.9fr) minmax(0,1fr) auto minmax(158px,1.3fr) auto;
   border:3px solid var(--line-strong);border-radius:10px;
-  padding:clamp(8px,.7vh,12px) clamp(10px,.85vw,14px);
+  padding:var(--cluster-pad-y) var(--cluster-pad-x);
   background:linear-gradient(180deg,#07100a,#030505);
   box-shadow:inset 0 0 24px #39ff1412,0 0 12px #39ff1420;
 }}
@@ -1069,7 +1194,7 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
   border:2px solid #5a3a00;border-radius:4px;background:#0a0a0a;overflow:hidden;
 }}
 .view-tog{{position:absolute;top:8px;left:10px;z-index:50;}}
-.mode-tog{{position:absolute;right:10px;bottom:8px;z-index:20;}}
+.mode-tog{{position:absolute;right:0;top:50%;transform:translateY(-50%);z-index:20;}}
 .view-tog .vtab,.mode-tog .mtab{{
   appearance:none;cursor:pointer;border:0;border-right:1px solid #5a3a00;background:#0a0a0a;color:#9a7a30;
   font:700 11px/1 ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;letter-spacing:.04em;
@@ -1258,7 +1383,7 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
 .sw.empty{{border-color:#3d5240 !important;}}
 #tip{{position:fixed;display:none;background:#000;border:2px solid var(--green);color:var(--green-bright);
   font-size:12px;padding:5px 9px;border-radius:4px;pointer-events:none;z-index:10000;}}
-.foot{{text-align:center;color:var(--muted);font-size:clamp(11px,.85vw,13px);letter-spacing:.04em;flex-shrink:0;}}
+.foot{{text-align:center;color:var(--muted);font-size:clamp(11px,.85vw,13px);letter-spacing:.04em;flex-shrink:0;margin:0;}}.foot-bar{{position:relative;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:calc(-1 * var(--cluster-gap));margin-bottom:calc(-1 * var(--cluster-pad-y));min-height:calc(clamp(26px,3vh,34px) + var(--cluster-gap) + var(--cluster-pad-y));padding:0 clamp(2px,.3vw,6px);box-sizing:border-box;z-index:5;}}.foot-bar .foot{{flex:1;min-width:0;padding:0 110px 0 0;box-sizing:border-box;}}
 .bill-grid{{grid-template-columns:repeat(auto-fit,minmax(min(180px,100%),1fr));height:auto;align-content:stretch;}}
 .card.bill{{justify-content:center;padding:clamp(5px,.4vh,9px) clamp(6px,.5vw,9px);overflow:visible;}}
 .bill-row{{display:flex;align-items:center;gap:clamp(5px,.45vw,9px);min-width:0;width:100%;}}
@@ -1273,7 +1398,7 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}}
 .bill-meta .muted{{white-space:normal;overflow:hidden;text-overflow:ellipsis;margin:0;font-size:clamp(8px,.7vw,11px);line-height:1.2;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}}
-.hof-grid{{grid-template-columns:repeat(4,minmax(0,1fr));height:auto;overflow:hidden;align-content:end;min-height:0;padding-bottom:24px;box-sizing:border-box;}}
+.hof-grid{{grid-template-columns:repeat(4,minmax(0,1fr));height:auto;overflow:hidden;align-content:end;min-height:0;padding-bottom:0;box-sizing:border-box;}}
 .panel:has(.hof-grid){{position:relative;overflow:hidden;min-height:0;}}
 .card.hof{{overflow:hidden;min-height:0;}}
 .foot{{position:relative;z-index:2;background:var(--bg);}}
@@ -1349,13 +1474,15 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
 <div class=panel>
   <h2>Hall of fame: hungriest models</h2>
   <div class="grid hof-grid">{modrows}</div>
+</div>
+
+<div class="foot-bar">
+  <p class=foot>No GPUs were harmed. Several cloud invoices were.</p>
   <div class="mode-tog" aria-label="Local or cloud">
     <a class="mtab on" href="/" title="Local annihilator">LOCAL</a>
     <a class="mtab" href="/cloud" title="Cloud usage">CLOUD</a>
   </div>
 </div>
-
-<p class=foot>No GPUs were harmed. Several cloud invoices were.</p>
 </div>
 <script>var t=document.getElementById('tip');document.querySelectorAll('rect[data-t]').forEach(function(r){{r.onmousemove=function(e){{t.textContent=r.dataset.t;t.style.display='block';t.style.left=(e.clientX+12)+'px';t.style.top=(e.clientY+12)+'px'}};r.onmouseleave=function(){{t.style.display='none'}}}});</script>
 <script>(function(){{
@@ -1432,7 +1559,7 @@ def page_mobile():
     P = "source='proxy'"
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COUNT(*) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
-    days = q(f"SELECT date(ts,'unixepoch','localtime') d, SUM(COALESCE(input_tokens,0)), SUM(COALESCE(output_tokens,0)) FROM requests WHERE {P} GROUP BY d ORDER BY d DESC LIMIT 8")
+    days = devastation_day_rows(q, P, 5)
     models = q(f"SELECT COALESCE(model,'?'), COUNT(*), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 3")
     cal = calendar(c); c.close()
     try: prices = json.load(open(PRICES))["models"]
@@ -1469,6 +1596,16 @@ def page_mobile():
         "<li class=muted>The silence before the storm. Point a client at port %d.</li>" % PROXY_PORT
     )
     _tot = sum(t or 0 for _, _, t in models) or 1
+    # OpenCode → Spark local usage as a Hall of Fame entry (same card style).
+    # Tokens already flow through the proxy; do not inflate _tot.
+    try:
+        _oc = _opencode_agg("all", bucket="local")
+        if _oc.get("ok") and int(_oc.get("tot") or 0) > 0:
+            models = list(models) + [("OpenCode → Spark", int(_oc.get("n") or 0), int(_oc.get("tot") or 0))]
+            models.sort(key=lambda r: (r[2] or 0), reverse=True)
+            models = models[:40]
+    except Exception:
+        pass
     _medal = {0: "#1 legend", 1: "#2 champion", 2: "#3 master"}
     models = models[:3]
     modrows = "".join(
@@ -1521,6 +1658,7 @@ def page_mobile():
     except Exception:
         pass
 
+
     return f"""<!doctype html><html lang=en><head>
 <meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -1551,8 +1689,9 @@ body::before{{content:"";pointer-events:none;position:fixed;inset:0;z-index:9999
   background:repeating-linear-gradient(0deg,rgba(0,0,0,.08) 0,rgba(0,0,0,.08) 1px,transparent 1px,transparent 3px);opacity:.14;}}
 .cluster{{
   position:relative;
-  width:100%;max-width:480px;margin:0 auto;display:flex;flex-direction:column;gap:12px;
-  border:3px solid var(--line-strong);border-radius:12px;padding:12px 10px;
+  --cluster-gap:12px;--cluster-pad-y:12px;--cluster-pad-x:10px;
+  width:100%;max-width:480px;margin:0 auto;display:flex;flex-direction:column;gap:var(--cluster-gap);
+  border:3px solid var(--line-strong);border-radius:12px;padding:var(--cluster-pad-y) var(--cluster-pad-x);
   overflow-x:hidden;
   background:linear-gradient(180deg,#07100a,#030505);
   box-shadow:inset 0 0 24px #39ff1412,0 0 12px #39ff1420;
@@ -1570,9 +1709,19 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.06em;text-transform:upper
   text-align:center;white-space:nowrap;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;
 }}
 .dash-toggle:hover,.dash-toggle:active{{color:var(--green-bright);border-color:var(--line);}}
-.foot-bar{{display:flex;flex-direction:column;align-items:stretch;gap:6px;padding-top:2px;width:100%;}}
-.foot-bar .foot{{padding-top:0;margin:0;text-align:center;overflow-wrap:anywhere;}}
+.foot-bar{{position:relative;display:flex;align-items:center;justify-content:center;width:100%;box-sizing:border-box;z-index:5;
+  margin-top:calc(-1 * var(--cluster-gap));margin-bottom:calc(-1 * var(--cluster-pad-y));
+  min-height:calc(32px + var(--cluster-gap) + var(--cluster-pad-y));padding:2px 0;}}
+.foot-bar .foot{{padding:0 100px 0 0;margin:0;text-align:center;overflow-wrap:anywhere;flex:1;min-width:0;}}
 .foot-bar .dash-toggle{{margin-left:auto;}}
+.view-tog,.mode-tog{{display:inline-flex;flex-wrap:nowrap;gap:0;align-items:stretch;padding:0;
+  border:2px solid #5a3a00;border-radius:4px;background:#0a0a0a;overflow:hidden;}}
+.mode-tog{{position:absolute;right:0;top:50%;transform:translateY(-50%);z-index:20;}}
+.mode-tog .mtab{{appearance:none;cursor:pointer;border:0;border-right:1px solid #5a3a00;background:#0a0a0a;color:#9a7a30;
+  font:700 11px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;padding:4px 9px;text-align:center;
+  white-space:nowrap;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;}}
+.mode-tog .mtab:last-child{{border-right:0;}}
+.mode-tog .mtab.on{{color:#1a1000;background:var(--warn);box-shadow:inset 0 0 5px rgba(255,255,255,.12);}}
 .wl-row{{display:flex;flex-wrap:wrap;gap:5px;}}
 .range-tog{{display:flex;flex-wrap:wrap;gap:3px;width:100%;max-width:100%;padding:2px;border:1px solid var(--line-strong);
   border-radius:4px;background:#040806;justify-content:center;margin-top:4px;overflow:hidden;}}
@@ -1843,15 +1992,15 @@ if(active!=='all') loadRange(active, true); else localStorage.setItem(KEY,'all')
 
 
 def page_cloud(mobile=False, range_key="all"):
-    """Dedicated Cloud Usage dashboard (Codex/GPT, Grok Bot, OpenCode)."""
+    """Dedicated Cloud Usage dashboard (Codex/GPT, Grok Bot, DeepSeek via OpenCode)."""
     rk = (range_key or "all").lower()
     rk = RANGE_ALIASES.get(rk, rk)
     if rk not in RANGES: rk = "all"
     providers = load_cloud_providers(rk)
     cov_bits = []
     for _p in providers:
-        if _p.get("id") == "opencode":
-            cov_bits.append("OpenCode: real (%s) from local opencode.db" % RANGE_META.get(rk, (rk,))[0].lower())
+        if _p.get("id") == "deepseek-opencode":
+            cov_bits.append("DeepSeek (via OpenCode): real (%s) from opencode.db deepseek* sessions" % RANGE_META.get(rk, (rk,))[0].lower())
         elif _p.get("id") == "codex":
             cov_bits.append("Codex: real today/week/all from session rollouts; other tabs approximate")
         elif _p.get("id") == "grok":
@@ -1936,8 +2085,9 @@ body::before{{content:"";pointer-events:none;position:fixed;inset:0;z-index:9999
   background:repeating-linear-gradient(0deg,rgba(0,0,0,.08) 0,rgba(0,0,0,.08) 1px,transparent 1px,transparent 3px);opacity:.14;}}
 .cluster{{
   position:relative;
-  width:100%;max-width:{cluster_max};margin:0 auto;display:flex;flex-direction:column;gap:14px;
-  border:3px solid var(--line-strong);border-radius:12px;padding:16px 14px;
+  --cluster-gap:14px;--cluster-pad-y:16px;--cluster-pad-x:14px;
+  width:100%;max-width:{cluster_max};margin:0 auto;display:flex;flex-direction:column;gap:var(--cluster-gap);
+  border:3px solid var(--line-strong);border-radius:12px;padding:var(--cluster-pad-y) var(--cluster-pad-x);
   overflow-x:hidden;
   background:linear-gradient(180deg,#07100a,#030505);
   box-shadow:inset 0 0 24px #39ff1412,0 0 12px #39ff1420;
@@ -2035,7 +2185,7 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 .range-cov{{font-size:11px;color:var(--muted);letter-spacing:.03em;margin:0 0 8px;line-height:1.35;}}
 .view-tog,.mode-tog{{display:inline-flex;gap:0;border:2px solid #5a3a00;border-radius:4px;background:#0a0a0a;overflow:hidden;}}
 .view-tog{{position:absolute;top:8px;left:10px;z-index:50;}}
-.mode-tog{{position:absolute;right:10px;bottom:8px;z-index:20;}}
+.mode-tog{{position:absolute;right:0;top:50%;transform:translateY(-50%);z-index:20;}}
 .view-tog .vtab,.mode-tog .mtab{{border:0;border-right:1px solid #5a3a00;background:#0a0a0a;color:#9a7a30;font:700 11px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;padding:4px 9px;text-decoration:none;display:inline-flex;align-items:center;}}
 .view-tog .vtab:last-child,.mode-tog .mtab:last-child{{border-right:0;}}
 .view-tog .vtab.on,.mode-tog .mtab.on{{color:#1a1000;background:var(--warn);}}
@@ -2043,13 +2193,13 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 
 .cluse-card.status-awaiting .cluse-note{{color:var(--warn);}}
 .muted{{color:var(--muted);}}
-.foot{{text-align:center;color:var(--muted);font-size:12px;letter-spacing:.03em;padding-top:4px;}}
+.foot{{text-align:center;color:var(--muted);font-size:12px;letter-spacing:.03em;padding:0;margin:0;}}.foot-bar{{position:relative;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:calc(-1 * var(--cluster-gap));margin-bottom:calc(-1 * var(--cluster-pad-y));min-height:calc(32px + var(--cluster-gap) + var(--cluster-pad-y));padding:0 2px;box-sizing:border-box;z-index:5;}}.foot-bar .foot{{flex:1;min-width:0;padding:0 110px 0 0;box-sizing:border-box;}}
 {tog_css}
 </style></head><body><div class=cluster>
 <div class=hdr>
   <h1>{T}</h1>
 </div>
-<div class=tagline>Non-Spark cloud spend and quota · Codex / GPT · Grok Bot · OpenCode · refreshed {datetime.now():%b %d %H:%M}.</div>
+<div class=tagline>Non-Spark cloud spend and quota · Codex / GPT · Grok Bot · DeepSeek (via OpenCode) · refreshed {datetime.now():%b %d %H:%M}.</div>
 <div class=hero>
   <div class="view-tog" aria-label="Desktop or mobile">
     <a class="vtab{" on" if not mobile else ""}" href="/cloud" title="Desktop cloud">DESKTOP</a>
@@ -2064,8 +2214,7 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
   <p class="range-cov">{range_cov}</p>
   <div class="cluse-grid">{cards}</div>
 </div>
-<p class=foot>Quota meters only — Token CEO does not pause queues.</p>
-<div class="mode-tog" aria-label="Local or cloud"><a class="mtab" href="{back_href}" title="Local annihilator">LOCAL</a><a class="mtab on" href="/cloud{"/m" if mobile else ""}" title="Cloud usage">CLOUD</a></div>
+<div class="foot-bar"><p class=foot>Quota meters only — Token CEO does not pause queues.</p><div class="mode-tog" aria-label="Local or cloud"><a class="mtab" href="{back_href}" title="Local annihilator">LOCAL</a><a class="mtab on" href="/cloud{"/m" if mobile else ""}" title="Cloud usage">CLOUD</a></div></div>
 </div>
 <script>(function(){{
 var tabs=document.querySelectorAll('.hero .range-tog .rtab[data-range]');
