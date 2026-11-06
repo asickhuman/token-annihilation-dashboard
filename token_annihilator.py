@@ -726,7 +726,7 @@ def render_cloud_usage_cards(providers, compact=False, show_stats=None):
 def db():
     c = sqlite3.connect(DB, timeout=10)
     c.execute("""CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, ts REAL, model TEXT, endpoint TEXT,
-      input_tokens INTEGER, output_tokens INTEGER, duration_s REAL, eval_s REAL, status INTEGER, source TEXT, dedupe TEXT UNIQUE)""")
+      input_tokens INTEGER, output_tokens INTEGER, duration_s REAL, eval_s REAL, status INTEGER, source TEXT, dedupe TEXT UNIQUE, request_count INTEGER DEFAULT 1)""")
     return c
 
 def log_row(**r):
@@ -866,17 +866,17 @@ def _range_dates(key):
     return today.replace(month=1, day=1).isoformat(), today.isoformat(), None, None, key
 
 def _sum_range(c, start, end):
-    P = "source='proxy'"
+    P = "source IN ('proxy','hermes-direct')"
     if start is None:
         tin, tout, nreq = c.execute(
-            f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COUNT(*) FROM requests WHERE {P}"
+            f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}"
         ).fetchone()
         tps = c.execute(
             f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0"
         ).fetchone()[0]
     else:
         tin, tout, nreq = c.execute(
-            f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COUNT(*) FROM requests WHERE {P} AND date(ts,'unixepoch','localtime') BETWEEN ? AND ?",
+            f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P} AND date(ts,'unixepoch','localtime') BETWEEN ? AND ?",
             (start, end),
         ).fetchone()
         tps = c.execute(
@@ -950,7 +950,7 @@ def hof_card_html(rank_lbl, name, tokens, nreq, pct):
 
 def calendar(c):
     from datetime import date, timedelta
-    rows = c.execute("SELECT date(ts,'unixepoch','localtime'), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) FROM requests WHERE source='proxy' GROUP BY 1").fetchall()
+    rows = c.execute("SELECT date(ts,'unixepoch','localtime'), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) FROM requests WHERE source IN ('proxy','hermes-direct') GROUP BY 1").fetchall()
     per = {d: t or 0 for d, t in rows}
     today = date.today(); end = today + timedelta(days=(5 - today.weekday()) % 7)
     start = end - timedelta(days=52 * 7 - 1 + 7); start -= timedelta(days=(start.weekday() + 1) % 7)
@@ -1011,11 +1011,11 @@ def months_join(m):
 
 def page():
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
-    P = "source='proxy'"
-    tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COUNT(*) FROM requests WHERE {P}")[0]
+    P = "source IN ('proxy','hermes-direct')"
+    tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
-    models = q(f"SELECT COALESCE(model,'?'), COUNT(*), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 40")
+    models = q(f"SELECT COALESCE(model,'?'), SUM(COALESCE(request_count,1)), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 40")
     cal = calendar(c); c.close()
     try: prices = json.load(open(PRICES))["models"]
     except Exception: prices = []
@@ -1556,11 +1556,11 @@ if(slot && sel){{
 def page_mobile():
     """Portrait mobile layout. Same data as page(); separate markup/CSS only."""
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
-    P = "source='proxy'"
-    tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COUNT(*) FROM requests WHERE {P}")[0]
+    P = "source IN ('proxy','hermes-direct')"
+    tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
-    models = q(f"SELECT COALESCE(model,'?'), COUNT(*), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 3")
+    models = q(f"SELECT COALESCE(model,'?'), SUM(COALESCE(request_count,1)), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 3")
     cal = calendar(c); c.close()
     try: prices = json.load(open(PRICES))["models"]
     except Exception: prices = []
@@ -2360,7 +2360,7 @@ def office2d_tokens_payload(n=7):
         c = db()
         try:
             q = lambda sql, *a: c.execute(sql, a).fetchall()
-            rows = devastation_day_rows(q, "source='proxy'", n)
+            rows = devastation_day_rows(q, "source IN ('proxy','hermes-direct')", n)
         finally:
             c.close()
         m = {d: a + b for d, a, b in rows}
@@ -2397,7 +2397,7 @@ def office2d_tokens_payload(n=7):
         cloud = None
     return {"days": days, "cloud": cloud, "local": local,
             "cloud_sources": "codex per-day deltas from rollouts, cached input excluded + opencode cloud sessions; grok excluded (plan % only, no token counts)",
-            "codex_with_cached": [codex_raw.get(d) for d in days], "local_source": "stats.db requests source='proxy'", "now": time.time()}
+            "codex_with_cached": [codex_raw.get(d) for d in days], "local_source": "stats.db requests source IN ('proxy','hermes-direct')", "now": time.time()}
 
 def office_json_payload(since_sec=None):
     now = time.time()
