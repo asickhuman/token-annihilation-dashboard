@@ -404,8 +404,12 @@ def _opencode_range_bounds_ms(range_key="all"):
     key = RANGE_ALIASES.get(key, key)
     if key not in ("all", "today", "dod", "mtd", "weekly", "monthly", "yearly"):
         key = "all"
-    if key in ("today", "dod"):
+    if key == "today":
         return key, day_start_ms(today), day_start_ms(today + timedelta(days=1))
+    if key == "dod":
+        # Rolling last 24 hours ending now (ms), not calendar day.
+        now_ms = int(time.time() * 1000)
+        return key, now_ms - 24 * 60 * 60 * 1000, now_ms
     if key == "weekly":
         return key, day_start_ms(today - timedelta(days=6)), day_start_ms(today + timedelta(days=1))
     if key == "mtd":
@@ -583,7 +587,11 @@ def load_cloud_providers(range_key="all"):
             "detail": detail,
         })
     stats = []
-    if today_tok or week_tok:
+    if range_key == "dod":
+        now_ts = time.time()
+        h24 = _codex_tokens_window(now_ts - 86400, now_ts)
+        stats.append({"label": "24H tok", "value": h24})
+    elif today_tok or week_tok:
         stats.append({"label": "Today tok", "value": today_tok})
         stats.append({"label": "Week tok", "value": week_tok})
     providers.append({
@@ -826,13 +834,13 @@ RANGES = ("all", "today", "dod", "mtd", "weekly", "monthly", "yearly")
 RANGE_META = {
     "all": ("ALL", "TOTAL TOKENS ANNIHILATED", "Lifetime · all recorded proxy traffic"),
     "today": ("TODAY", "TOKENS ANNIHILATED, TODAY", "Today (America/New_York)"),
-    "dod": ("DoD", "TOKENS ANNIHILATED, DoD", "Day over day · today vs yesterday"),
+    "dod": ("24H", "TOKENS ANNIHILATED, 24H", "Rolling · last 24 hours vs prior 24 hours"),
     "mtd": ("MTD", "TOKENS ANNIHILATED, MTD", "Month to date · 1st through today"),
     "weekly": ("7D", "TOKENS ANNIHILATED, 7D", "Rolling week · last 7 days"),
     "monthly": ("30D", "TOKENS ANNIHILATED, 30D", "Rolling month · last 30 days"),
     "yearly": ("YTD", "TOKENS ANNIHILATED, YTD", "Year to date · Jan 1 through today"),
 }
-RANGE_ALIASES = {"7d": "weekly", "30d": "monthly", "ytd": "yearly", "week": "weekly", "month": "monthly", "year": "yearly"}
+RANGE_ALIASES = {"7d": "weekly", "30d": "monthly", "ytd": "yearly", "week": "weekly", "month": "monthly", "year": "yearly", "24h": "dod", "24hr": "dod", "last24": "dod"}
 
 def _today_et():
     """Calendar date in America/New_York."""
@@ -855,8 +863,8 @@ def _range_dates(key):
     if key == "today":
         return today.isoformat(), today.isoformat(), None, None, key
     if key == "dod":
-        y = today - timedelta(days=1)
-        return today.isoformat(), today.isoformat(), y.isoformat(), y.isoformat(), key
+        # Rolling windows are computed in stats_payload via timestamps.
+        return "rolling-24h", "now", "prior-24h", "rolling-24h", key
     if key == "mtd":
         return today.replace(day=1).isoformat(), today.isoformat(), None, None, key
     if key == "weekly":
@@ -885,15 +893,70 @@ def _sum_range(c, start, end):
         ).fetchone()[0]
     return int(tin or 0), int(tout or 0), int(nreq or 0), tps
 
+def _sum_range_ts(c, start_ts, end_ts):
+    """Sum proxy/hermes tokens in a half-open unix-timestamp window [start_ts, end_ts)."""
+    P = "source IN ('proxy','hermes-direct')"
+    tin, tout, nreq = c.execute(
+        f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P} AND ts>=? AND ts<?",
+        (float(start_ts), float(end_ts)),
+    ).fetchone()
+    tps = c.execute(
+        f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0 AND ts>=? AND ts<?",
+        (float(start_ts), float(end_ts)),
+    ).fetchone()[0]
+    return int(tin or 0), int(tout or 0), int(nreq or 0), tps
+
+def _codex_tokens_window(start_ts, end_ts):
+    """Sum uncached Codex token deltas from rollout events in [start_ts, end_ts)."""
+    total = 0
+    cutoff = float(start_ts) - 86400
+    try:
+        for root, _d, files in os.walk(CODEX_SESSIONS):
+            for name in files:
+                if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                    continue
+                p = os.path.join(root, name)
+                try:
+                    if os.path.getmtime(p) < cutoff:
+                        continue
+                    prev = None
+                    with open(p, errors="ignore") as f:
+                        for line in f:
+                            if "total_token_usage" not in line:
+                                continue
+                            try:
+                                o = json.loads(line)
+                                tu = ((o.get("payload") or {}).get("info") or {}).get("total_token_usage") or {}
+                                cur = (
+                                    int(tu.get("input_tokens") or 0),
+                                    int(tu.get("cached_input_tokens") or 0),
+                                    int(tu.get("output_tokens") or 0),
+                                )
+                                ets = datetime.fromisoformat(o["timestamp"].replace("Z", "+00:00")).timestamp()
+                            except Exception:
+                                continue
+                            dlt = cur if (prev is None or cur[0] < prev[0]) else tuple(a - b for a, b in zip(cur, prev))
+                            prev = cur
+                            if start_ts <= ets < end_ts:
+                                total += max(0, dlt[0] - dlt[1]) + dlt[2]
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return int(total)
+
 def stats_payload(range_key="all"):
     start, end, ps, pe, key = _range_dates(range_key)
     short, hero_lbl, base_sub = RANGE_META[key]
     c = db()
     try:
-        tin, tout, nreq, tps = _sum_range(c, start, end)
         delta = None
-        if key == "dod" and ps and pe:
-            ptin, ptout, pnreq, _ = _sum_range(c, ps, pe)
+        if key == "dod":
+            now_ts = time.time()
+            cur_start, cur_end = now_ts - 86400, now_ts
+            prev_start, prev_end = now_ts - 2 * 86400, now_ts - 86400
+            tin, tout, nreq, tps = _sum_range_ts(c, cur_start, cur_end)
+            ptin, ptout, pnreq, _ = _sum_range_ts(c, prev_start, prev_end)
             ptot = ptin + ptout
             tot = tin + tout
             abs_d = tot - ptot
@@ -901,15 +964,19 @@ def stats_payload(range_key="all"):
             delta = {
                 "prev_tot": ptot, "abs": abs_d, "pct": round(pct, 1),
                 "dir": "up" if abs_d > 0 else ("down" if abs_d < 0 else "flat"),
-                "label": "vs yesterday (%s)" % ps,
+                "label": "vs prior 24H",
             }
-            subtitle = "Today (%s) vs yesterday (%s)" % (start, ps)
-        elif key == "today":
-            subtitle = "Today (America/New_York) · %s" % start
-        elif key == "all":
-            subtitle = "Lifetime"
+            start = datetime.fromtimestamp(cur_start).strftime("%Y-%m-%d %H:%M")
+            end = datetime.fromtimestamp(cur_end).strftime("%Y-%m-%d %H:%M")
+            subtitle = "Last 24 hours · %s – %s ET vs prior 24H" % (start, end)
         else:
-            subtitle = "%s · %s – %s" % (base_sub.split("·")[0].strip(), start, end)
+            tin, tout, nreq, tps = _sum_range(c, start, end)
+            if key == "today":
+                subtitle = "Today (America/New_York) · %s" % start
+            elif key == "all":
+                subtitle = "Lifetime"
+            else:
+                subtitle = "%s · %s – %s" % (base_sub.split("·")[0].strip(), start, end)
     finally:
         c.close()
     tot = tin + tout
@@ -2002,12 +2069,18 @@ def page_cloud(mobile=False, range_key="all"):
         if _p.get("id") == "deepseek-opencode":
             cov_bits.append("DeepSeek (via OpenCode): real (%s) from opencode.db deepseek* sessions" % RANGE_META.get(rk, (rk,))[0].lower())
         elif _p.get("id") == "codex":
-            cov_bits.append("Codex: real today/week/all from session rollouts; other tabs approximate")
+            cov_bits.append("Codex: today/week/all + rolling 24H from rollout event deltas; other tabs approximate")
         elif _p.get("id") == "grok":
             cov_bits.append("Grok: current snapshot only; historical ranges filling via cloud_snapshots.jsonl")
     range_cov = " · ".join(cov_bits)
     range_tabs = range_tabs_html(rk, include_mobile=False)
-    if rk in ("today", "dod"):
+    if rk == "dod":
+        for _p in providers:
+            if _p.get("id") == "codex":
+                _p["stats"] = [s for s in (_p.get("stats") or []) if s.get("label") == "24H tok"]
+            if _p.get("id") == "grok":
+                _p["note"] = ((_p.get("note") or "") + " · snapshot=current (no rolling token counts)").strip(" ·")
+    elif rk == "today":
         for _p in providers:
             if _p.get("id") == "codex":
                 _p["stats"] = [s for s in (_p.get("stats") or []) if s.get("label") == "Today tok"]
