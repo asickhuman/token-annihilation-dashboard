@@ -434,17 +434,16 @@ def _opencode_agg(range_key="all", bucket="deepseek"):
     try:
         con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
         try:
+            # Per-response attribution: the model that actually served each assistant message.
+            q = ("SELECT json_extract(data,'$.model'),"
+                 "COALESCE(json_extract(data,'$.tokens.input'),0),"
+                 "COALESCE(json_extract(data,'$.tokens.output'),0),"
+                 "COALESCE(json_extract(data,'$.tokens.reasoning'),0),"
+                 "COALESCE(json_extract(data,'$.cost'),0) FROM session_message WHERE type='assistant'")
             if start_ms is None:
-                rows = con.execute(
-                    "SELECT model,COALESCE(tokens_input,0),COALESCE(tokens_output,0),"
-                    "COALESCE(tokens_reasoning,0),COALESCE(cost,0) FROM session_v2"
-                ).fetchall()
+                rows = con.execute(q).fetchall()
             else:
-                rows = con.execute(
-                    "SELECT model,COALESCE(tokens_input,0),COALESCE(tokens_output,0),"
-                    "COALESCE(tokens_reasoning,0),COALESCE(cost,0) FROM session_v2 "
-                    "WHERE time_created>=? AND time_created<?", (start_ms, end_ms)
-                ).fetchall()
+                rows = con.execute(q + " AND time_created>=? AND time_created<?", (start_ms, end_ms)).fetchall()
         finally:
             con.close()
     except Exception as e:
@@ -945,7 +944,45 @@ def _codex_tokens_window(start_ts, end_ts):
         pass
     return int(total)
 
-def stats_payload(range_key="all"):
+def cloud_tokens_range(range_key="all", window=None):
+    """Cloud tokens by serving model: Codex (uncached in + out) + OpenCode DeepSeek (in + out + reasoning, cache reads excluded).
+    Grok is excluded: it only reports a usage percentage, not tokens."""
+    if window is not None:
+        s_ts, e_ts = window
+        codex = _codex_tokens_window(s_ts, e_ts)
+        ds = _opencode_window_tokens(int(s_ts * 1000), int(e_ts * 1000), "deepseek")
+        return codex + ds, codex, ds
+    key, s_ms, e_ms = _opencode_range_bounds_ms(range_key)
+    if s_ms is None:
+        try:
+            codex = int(_codex_session_token_totals()[2] or 0)
+        except Exception:
+            codex = 0
+    else:
+        codex = _codex_tokens_window(s_ms / 1000.0, e_ms / 1000.0)
+    ds = int(_opencode_agg(key, bucket="deepseek").get("tot") or 0)
+    return codex + ds, codex, ds
+
+
+def _opencode_window_tokens(s_ms, e_ms, bucket):
+    import sqlite3
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % OPENCODE_DB, uri=True)
+        try:
+            rows = con.execute("SELECT json_extract(data,'$.model'),COALESCE(json_extract(data,'$.tokens.input'),0)+COALESCE(json_extract(data,'$.tokens.output'),0)+COALESCE(json_extract(data,'$.tokens.reasoning'),0) FROM session_message WHERE type='assistant' AND time_created>=? AND time_created<?", (s_ms, e_ms)).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return 0
+    t = 0
+    for raw, n in rows:
+        mid, pid = _opencode_model_parts(raw)
+        if _opencode_bucket(mid, pid) == bucket:
+            t += int(n or 0)
+    return t
+
+
+def stats_payload(range_key="all", cloud=False):
     start, end, ps, pe, key = _range_dates(range_key)
     short, hero_lbl, base_sub = RANGE_META[key]
     c = db()
@@ -980,8 +1017,27 @@ def stats_payload(range_key="all"):
     finally:
         c.close()
     tot = tin + tout
+    local_tot = tot
+    cloud_tot = codex_t = ds_t = None
+    if cloud:
+        if key == "dod":
+            cloud_tot, codex_t, ds_t = cloud_tokens_range(window=(cur_start, cur_end))
+            pc, _, _ = cloud_tokens_range(window=(prev_start, prev_end))
+            ptot2 = ptot + pc
+            tot2 = tot + cloud_tot
+            abs_d = tot2 - ptot2
+            pct = (100.0 * abs_d / ptot2) if ptot2 else (100.0 if tot2 else 0.0)
+            delta = {"prev_tot": ptot2, "abs": abs_d, "pct": round(pct, 1),
+                     "dir": "up" if abs_d > 0 else ("down" if abs_d < 0 else "flat"),
+                     "label": "vs prior 24H"}
+        else:
+            cloud_tot, codex_t, ds_t = cloud_tokens_range(key)
+        tot = tot + cloud_tot
+        hero_lbl = hero_lbl + " + CLOUD"
     tps_v = float(tps) if tps else 0.0
     return {
+        "cloud": bool(cloud), "local_tot": local_tot, "cloud_tot": cloud_tot,
+        "cloud_codex": codex_t, "cloud_deepseek": ds_t,
         "range": key, "short": short, "hero_label": hero_lbl, "subtitle": subtitle,
         "start": start, "end": end,
         "tin": tin, "tout": tout, "tot": tot, "nreq": nreq,
@@ -991,7 +1047,7 @@ def stats_payload(range_key="all"):
         "ghost_tot": ghost_digits(fmt(tot)),
     }
 
-def range_tabs_html(active="all", include_mobile=False):
+def range_tabs_html(active="all", include_mobile=False, include_cloud=False):
     btns = []
     for key in RANGES:
         short, _, full = RANGE_META[key]
@@ -1001,6 +1057,8 @@ def range_tabs_html(active="all", include_mobile=False):
             '<button type="button" class="rtab%s" data-range="%s" role="tab" aria-selected="%s" title="%s">%s</button>'
             % (on, key, "true" if key == active else "false", title, short)
         )
+    if include_cloud:
+        btns.append('<button type="button" class="rtab ctog" id="cloud-tog" aria-pressed="false" title="Add cloud tokens (Codex + DeepSeek) to the local total">+ CLOUD</button>')
     if include_mobile:
         btns.append('<a class="rtab rtab-link" href="/m" title="Open mobile view">MOBILE</a>')
     return "".join(btns)
@@ -1117,14 +1175,7 @@ def page():
     _tot = sum(t or 0 for _, _, t in models) or 1
     # OpenCode → Spark local usage as a Hall of Fame entry (same card style).
     # Tokens already flow through the proxy; do not inflate _tot.
-    try:
-        _oc = _opencode_agg("all", bucket="local")
-        if _oc.get("ok") and int(_oc.get("tot") or 0) > 0:
-            models = list(models) + [("OpenCode → Spark", int(_oc.get("n") or 0), int(_oc.get("tot") or 0))]
-            models.sort(key=lambda r: (r[2] or 0), reverse=True)
-            models = models[:40]
-    except Exception:
-        pass
+    # Attribution by serving model: OpenCode's local Flash calls already sit in the proxy model rows.
     _medal = {0: "#1 legend", 1: "#2 champion", 2: "#3 master"}
     top3 = models[:3]
     rest = models[3:]
@@ -1193,7 +1244,7 @@ def page():
     lights.extend(spark_temp_lights())
     lights_html = "".join('<span class="wl %s%s">%s</span>' % (c, " on" if on else "", lab) for lab, on, c in lights)
 
-    range_tabs = range_tabs_html("all", include_mobile=False)
+    range_tabs = range_tabs_html("all", include_mobile=False, include_cloud=True)
     T = "DGX Token Annihilator Dashboard"
     VFD_B64 = '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'
 
@@ -1246,6 +1297,10 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 .rtab:hover{{color:var(--green-mid);border-color:var(--line);}}
 .rtab.on{{color:#041204;background:var(--green);border-color:var(--green-bright);
   box-shadow:0 0 5px rgba(57,255,20,.45);}}
+.rtab.ctog{{color:#5a1a1a;background:#120606;border-color:#3a1212;box-shadow:none;text-shadow:none;}}
+.rtab.ctog:hover{{color:#a33;border-color:#5a1a1a;}}
+.rtab.ctog.on{{color:#fff4f0;background:#ff1a1a;border-color:#ff6a5a;text-shadow:0 0 4px rgba(255,220,210,.9);
+  box-shadow:0 0 6px rgba(255,30,30,.9),0 0 14px rgba(255,30,30,.55),inset 0 0 4px rgba(255,255,255,.35);}}
 .rtab.rtab-link{{color:var(--muted);}}
 .rtab.rtab-link:hover{{color:var(--green-bright);}}
 .dash-toggle{{
@@ -1583,8 +1638,13 @@ function applyHero(d){{
     b.setAttribute('aria-selected', on?'true':'false');
   }});
 }}
+var CKEY='tad-cloud';
+var cloudOn=localStorage.getItem(CKEY)==='1';
+var curRange=active;
+function paintCloud(){{ var b=$('cloud-tog'); if(!b) return; b.classList.toggle('on', cloudOn); b.setAttribute('aria-pressed', cloudOn?'true':'false'); }}
 function loadRange(range, save){{
-  fetch('/api/stats?range='+encodeURIComponent(range))
+  curRange=range;
+  fetch('/api/stats?range='+encodeURIComponent(range)+(cloudOn?'&cloud=1':''))
     .then(function(r){{ if(!r.ok) throw new Error('bad'); return r.json(); }})
     .then(function(d){{ applyHero(d); if(save!==false) localStorage.setItem(KEY, d.range); }})
     .catch(function(e){{ console.warn('range fetch failed', e); }});
@@ -1592,7 +1652,9 @@ function loadRange(range, save){{
 document.querySelectorAll('.rtab[data-range]').forEach(function(b){{
   b.addEventListener('click', function(){{ var r=b.getAttribute('data-range'); if(r) loadRange(r, true); }});
 }});
-if(active!=='all') loadRange(active, true); else localStorage.setItem(KEY,'all');
+(function(){{ var b=$('cloud-tog'); if(!b) return; paintCloud();
+  b.addEventListener('click', function(){{ cloudOn=!cloudOn; localStorage.setItem(CKEY, cloudOn?'1':'0'); paintCloud(); loadRange(curRange, false); }}); }})();
+if(active!=='all' || cloudOn) loadRange(active, true); else localStorage.setItem(KEY,'all');
 
 var slot=$('hof-slot4');
 var sel=$('hof-pick-sel');
@@ -1665,14 +1727,7 @@ def page_mobile():
     _tot = sum(t or 0 for _, _, t in models) or 1
     # OpenCode → Spark local usage as a Hall of Fame entry (same card style).
     # Tokens already flow through the proxy; do not inflate _tot.
-    try:
-        _oc = _opencode_agg("all", bucket="local")
-        if _oc.get("ok") and int(_oc.get("tot") or 0) > 0:
-            models = list(models) + [("OpenCode → Spark", int(_oc.get("n") or 0), int(_oc.get("tot") or 0))]
-            models.sort(key=lambda r: (r[2] or 0), reverse=True)
-            models = models[:40]
-    except Exception:
-        pass
+    # Attribution by serving model: OpenCode's local Flash calls already sit in the proxy model rows.
     _medal = {0: "#1 legend", 1: "#2 champion", 2: "#3 master"}
     models = models[:3]
     modrows = "".join(
@@ -1714,7 +1769,7 @@ def page_mobile():
     lights.extend(spark_temp_lights())
     lights_html = "".join('<span class="wl %s%s">%s</span>' % (c, " on" if on else "", lab) for lab, on, c in lights)
 
-    range_tabs = range_tabs_html("all", include_mobile=False)
+    range_tabs = range_tabs_html("all", include_mobile=False, include_cloud=True)
     T = "DGX Token Annihilator"
     # reuse same embedded VFD font as desktop by reading it from page()'s constant if present;
     # fall back to serving without re-embedding (DSEG7 still loads from /font/)
@@ -1797,6 +1852,10 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.06em;text-transform:upper
   text-align:center;white-space:nowrap;text-decoration:none;flex:1 1 auto;min-width:40px;
   display:inline-flex;align-items:center;justify-content:center;}}
 .rtab.on{{color:#041204;background:var(--green);border-color:var(--green-bright);}}
+.rtab.ctog{{color:#5a1a1a;background:#120606;border-color:#3a1212;box-shadow:none;text-shadow:none;}}
+.rtab.ctog:hover{{color:#a33;border-color:#5a1a1a;}}
+.rtab.ctog.on{{color:#fff4f0;background:#ff1a1a;border-color:#ff6a5a;text-shadow:0 0 4px rgba(255,220,210,.9);
+  box-shadow:0 0 6px rgba(255,30,30,.9),0 0 14px rgba(255,30,30,.55),inset 0 0 4px rgba(255,255,255,.35);}}
 .rtab.rtab-link{{color:var(--muted);flex:0 0 auto;}}
 .hero .odo{{white-space:nowrap;}}
 .range-delta{{display:none;}}
@@ -2044,8 +2103,13 @@ function applyHero(d){{
     b.setAttribute('aria-selected', on?'true':'false');
   }});
 }}
+var CKEY='tad-cloud';
+var cloudOn=localStorage.getItem(CKEY)==='1';
+var curRange=active;
+function paintCloud(){{ var b=$('cloud-tog'); if(!b) return; b.classList.toggle('on', cloudOn); b.setAttribute('aria-pressed', cloudOn?'true':'false'); }}
 function loadRange(range, save){{
-  fetch('/api/stats?range='+encodeURIComponent(range))
+  curRange=range;
+  fetch('/api/stats?range='+encodeURIComponent(range)+(cloudOn?'&cloud=1':''))
     .then(function(r){{ if(!r.ok) throw new Error('bad'); return r.json(); }})
     .then(function(d){{ applyHero(d); if(save!==false) localStorage.setItem(KEY, d.range); }})
     .catch(function(e){{ console.warn('range fetch failed', e); }});
@@ -2053,7 +2117,9 @@ function loadRange(range, save){{
 document.querySelectorAll('.rtab[data-range]').forEach(function(b){{
   b.addEventListener('click', function(){{ var r=b.getAttribute('data-range'); if(r) loadRange(r, true); }});
 }});
-if(active!=='all') loadRange(active, true); else localStorage.setItem(KEY,'all');
+(function(){{ var b=$('cloud-tog'); if(!b) return; paintCloud();
+  b.addEventListener('click', function(){{ cloudOn=!cloudOn; localStorage.setItem(CKEY, cloudOn?'1':'0'); paintCloud(); loadRange(curRange, false); }}); }})();
+if(active!=='all' || cloudOn) loadRange(active, true); else localStorage.setItem(KEY,'all');
 }})();</script>
 </body></html>"""
 
@@ -2713,8 +2779,9 @@ class Dash(http.server.BaseHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
             rng = (qs.get("range") or ["all"])[0]
+            cl = (qs.get("cloud") or ["0"])[0] in ("1", "true", "on")
             try:
-                payload = json.dumps(stats_payload(rng)).encode()
+                payload = json.dumps(stats_payload(rng, cloud=cl)).encode()
                 code = 200
             except Exception as e:
                 payload = json.dumps({"error": str(e)}).encode(); code = 500
