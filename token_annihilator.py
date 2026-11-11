@@ -873,7 +873,7 @@ def _range_dates(key):
     return today.replace(month=1, day=1).isoformat(), today.isoformat(), None, None, key
 
 def _sum_range(c, start, end):
-    P = "source IN ('proxy','hermes-direct')"
+    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local')"
     if start is None:
         tin, tout, nreq = c.execute(
             f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}"
@@ -894,7 +894,7 @@ def _sum_range(c, start, end):
 
 def _sum_range_ts(c, start_ts, end_ts):
     """Sum proxy/hermes tokens in a half-open unix-timestamp window [start_ts, end_ts)."""
-    P = "source IN ('proxy','hermes-direct')"
+    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local')"
     tin, tout, nreq = c.execute(
         f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P} AND ts>=? AND ts<?",
         (float(start_ts), float(end_ts)),
@@ -1047,6 +1047,34 @@ def stats_payload(range_key="all", cloud=False):
         "ghost_tot": ghost_digits(fmt(tot)),
     }
 
+SPEED_LIVE_WIN = 600  # seconds: semi-live tach window
+def speed_payload(range_key="all"):
+    """Tach: average output tok/s (SUM out / SUM eval_s) over the selected period, plus all-time single-request peak."""
+    rk, lo_ms, hi_ms = _opencode_range_bounds_ms(range_key)
+    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local')"
+    c = db()
+    try:
+        now = time.time()
+        lo = (lo_ms / 1000.0) if lo_ms is not None else 0.0
+        hi = (hi_ms / 1000.0) if hi_ms is not None else now + 1
+        r = c.execute(f"SELECT SUM(output_tokens), SUM(eval_s), COUNT(*) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0 AND ts>=? AND ts<?", (lo, hi)).fetchone()
+        pk = c.execute(f"SELECT CAST(output_tokens AS REAL)/eval_s AS t, ts, model FROM requests WHERE {P} AND eval_s>=2 AND output_tokens>=64 ORDER BY t DESC LIMIT 1").fetchone()
+    finally:
+        c.close()
+    live = (float(r[0]) / float(r[1])) if (r and r[1]) else 0.0
+    peak = float(pk[0]) if pk else 0.0
+    scale = max(50, int(math.ceil(max(peak, live) * 1.05 / 20.0)) * 20)
+    step = 20 if scale <= 160 else 40
+    ticks = list(range(0, scale + 1, step))
+    if pk:
+        mdl = str(pk[2] or "?").split(":")[0]
+        when = datetime.fromtimestamp(pk[1]).strftime("%b %-d %-I:%M %p")
+        label = "PEAK %.1f · %s · %s ET" % (peak, mdl, when)
+    else:
+        label = "PEAK -"
+    return {"live": live, "live_disp": ("%.1f" % live) if live else "0.0", "live_reqs": int(r[2] or 0) if r else 0,
+            "range": rk, "range_label": RANGE_META.get(rk, ("ALL",))[0], "peak": peak, "peak_label": label, "scale": scale, "ticks": ticks}
+
 def range_tabs_html(active="all", include_mobile=False, include_cloud=False):
     btns = []
     for key in RANGES:
@@ -1075,7 +1103,7 @@ def hof_card_html(rank_lbl, name, tokens, nreq, pct):
 
 def calendar(c):
     from datetime import date, timedelta
-    rows = c.execute("SELECT date(ts,'unixepoch','localtime'), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) FROM requests WHERE source IN ('proxy','hermes-direct') GROUP BY 1").fetchall()
+    rows = c.execute("SELECT date(ts,'unixepoch','localtime'), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) FROM requests WHERE source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local') GROUP BY 1").fetchall()
     per = {d: t or 0 for d, t in rows}
     today = date.today(); end = today + timedelta(days=(5 - today.weekday()) % 7)
     start = end - timedelta(days=52 * 7 - 1 + 7); start -= timedelta(days=(start.weekday() + 1) % 7)
@@ -1136,7 +1164,7 @@ def months_join(m):
 
 def page():
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
-    P = "source IN ('proxy','hermes-direct')"
+    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local')"
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
@@ -1233,12 +1261,16 @@ def page():
                p["input_per_mtok"], p["output_per_mtok"])
         )
 
-    tps_v = float(tps) if tps else 0.0
-    tps_max = 50.0
+    SP = speed_payload()
+    tps_v = SP["live"]
+    tps_max = float(SP["scale"])
     tot = tin + tout
-    tps_disp = ("%.1f" % tps_v) if tps else "-"
+    tps_disp = SP["live_disp"]
     tach = seg_tach(36, tps_v / tps_max, True)
-    tach_scale = "".join("<span>%d</span>" % v for v in (0, 10, 20, 30, 40, 50))
+    tach_scale = "".join("<span>%d</span>" % v for v in SP["ticks"])
+    peak_label = html.escape(SP["peak_label"])
+    peak_short = "%.1f" % SP["peak"]
+    peak_mark = "<b class=peak-mark id=peak-mark style='left:%.2f%%' title='%s'></b>" % (100.0 * min(1.0, SP["peak"] / tps_max), peak_label)
     lights = [("IGN", True, "green"), ("PROXY", True, "green"), (str(PROXY_PORT), True, "green"),
               ("LOCAL ONLY", True, "green")]
     lights.extend(spark_temp_lights())
@@ -1488,6 +1520,7 @@ h2::before,h2::after{{content:"";flex:1;height:2px;background:linear-gradient(90
 .seg-on.warn{{background:var(--warn);border-color:#ffe066;box-shadow:0 0 5px rgba(255,204,0,.45),inset 0 0 3px rgba(255,255,255,.18);}}
 .seg-on.redline{{background:var(--redline);border-color:#ff8a6a;box-shadow:0 0 5px rgba(255,61,26,.5),inset 0 0 3px rgba(255,255,255,.18);}}
 .seg-off{{background:var(--unlit);border-color:var(--unlit-edge);}}
+.speed-track{{position:relative;}}.pk-short{{color:#ff8a6a;}}.speed-tach .speed-peak{{display:none;}}.peak-mark{{position:absolute;top:-4px;bottom:-4px;width:3px;margin-left:-1px;background:#ff3d1a;border-radius:1px;box-shadow:0 0 6px rgba(255,61,26,.9),0 0 12px rgba(255,61,26,.5);pointer-events:auto;}}.peak-mark::before{{content:'';position:absolute;top:-5px;left:-3px;border:4.5px solid transparent;border-top:5px solid #ff3d1a;}}.speed-peak{{font-size:10px;color:#ff8a6a;font-weight:800;letter-spacing:.06em;text-transform:uppercase;opacity:.9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .tach-scale{{display:flex;justify-content:space-between;font-size:clamp(10px,.75vw,12px);color:var(--muted);font-weight:700;}}
 table{{width:100%;border-collapse:collapse;font-size:clamp(12px,1.05vw,15px);table-layout:fixed;height:100%;}}
 td{{padding:clamp(4px,.35vh,6px) clamp(5px,.45vw,8px);border-bottom:2px solid var(--line);
@@ -1563,15 +1596,16 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
     <div class=card><div class=lbl>Words unleashed (output)</div><div class="big dseg seg" data-val="{fmt(tout)}" data-ghost="{ghost_digits(fmt(tout))}">{fmt(tout)}</div></div>
     <div class=card><div class=lbl>Requests vanquished</div><div class="big dseg seg" data-val="{fmt(nreq)}" data-ghost="{ghost_digits(fmt(nreq))}">{fmt(nreq)}</div></div>
     <div class="card speed">
-      <div class=lbl>Annihilation speed (out tok/s)</div>
+      <div class=lbl id=speed-lbl>Annihilation speed (avg · ALL)</div>
       <div class=speed-row>
         <div class=speed-tach>
-          <div class=tach-track>{tach}</div>
-          <div class=tach-scale>{tach_scale}</div>
+          <div class='tach-track speed-track' id=speed-tach>{tach}{peak_mark}</div>
+          <div class=tach-scale id=speed-scale>{tach_scale}</div>
+          <div class=speed-peak id=speed-peak>{peak_label}</div>
         </div>
         <div class=speed-readout>
-          <div class="big dseg seg" data-val="{tps_disp}" data-ghost="{ghost_digits(tps_disp)}">{tps_disp}</div>
-          <div class=speed-unit>tok/s</div>
+          <div class="big dseg seg" id=speed-val data-val="{tps_disp}" data-ghost="{ghost_digits(tps_disp)}">{tps_disp}</div>
+          <div class=speed-unit>tok/s · <span class=pk-short id=speed-pk title='{peak_label}'>peak {peak_short}</span></div>
         </div>
       </div>
     </div>
@@ -1638,12 +1672,27 @@ function applyHero(d){{
     b.setAttribute('aria-selected', on?'true':'false');
   }});
 }}
+function applySpeed(s){{
+  var t=$('speed-tach'); if(!t||!s||s.error) return;
+  var segs=t.querySelectorAll('i'); var n=segs.length;
+  var lit=Math.round(Math.max(0,Math.min(1,s.live/s.scale))*n);
+  var wf=Math.floor(0.70*n), rf=Math.floor(0.85*n);
+  segs.forEach(function(el,i){{ el.className = i<lit ? (i>=rf?'seg-on redline':(i>=wf?'seg-on warn':'seg-on')) : 'seg-off'; }});
+  setDseg($('speed-val'), s.live_disp);
+  var pm=$('peak-mark'); if(pm){{ pm.style.left=(100*Math.min(1,s.peak/s.scale))+'%'; pm.title=s.peak_label; }}
+  var pl=$('speed-peak'); if(pl) pl.textContent=s.peak_label;
+  var lb=$('speed-lbl'); if(lb&&s.range_label) lb.textContent='Annihilation speed (avg · '+s.range_label+')';
+  var pk=$('speed-pk'); if(pk){{ pk.textContent='peak '+s.peak.toFixed(1); pk.title=s.peak_label; }}
+  var sc=$('speed-scale'); if(sc&&s.ticks) sc.innerHTML=s.ticks.map(function(v){{return '<span>'+v+'</span>';}}).join('');
+}}
+function pollSpeed(){{ fetch('/api/speed?range='+encodeURIComponent(curRange||'all'),{{cache:'no-store'}}).then(function(r){{return r.json();}}).then(applySpeed).catch(function(){{}}); }}
+setInterval(pollSpeed, 30000);
 var CKEY='tad-cloud';
 var cloudOn=localStorage.getItem(CKEY)==='1';
 var curRange=active;
 function paintCloud(){{ var b=$('cloud-tog'); if(!b) return; b.classList.toggle('on', cloudOn); b.setAttribute('aria-pressed', cloudOn?'true':'false'); }}
 function loadRange(range, save){{
-  curRange=range;
+  curRange=range; pollSpeed();
   fetch('/api/stats?range='+encodeURIComponent(range)+(cloudOn?'&cloud=1':''))
     .then(function(r){{ if(!r.ok) throw new Error('bad'); return r.json(); }})
     .then(function(d){{ applyHero(d); if(save!==false) localStorage.setItem(KEY, d.range); }})
@@ -1685,7 +1734,7 @@ if(slot && sel){{
 def page_mobile():
     """Portrait mobile layout. Same data as page(); separate markup/CSS only."""
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
-    P = "source IN ('proxy','hermes-direct')"
+    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local')"
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
@@ -1758,12 +1807,16 @@ def page_mobile():
                p["input_per_mtok"], p["output_per_mtok"])
         )
 
-    tps_v = float(tps) if tps else 0.0
-    tps_max = 50.0
+    SP = speed_payload()
+    tps_v = SP["live"]
+    tps_max = float(SP["scale"])
     tot = tin + tout
-    tps_disp = ("%.1f" % tps_v) if tps else "-"
+    tps_disp = SP["live_disp"]
     tach = seg_tach(28, tps_v / tps_max, True)
-    tach_scale = "".join("<span>%d</span>" % v for v in (0, 10, 20, 30, 40, 50))
+    tach_scale = "".join("<span>%d</span>" % v for v in SP["ticks"])
+    peak_label = html.escape(SP["peak_label"])
+    peak_short = "%.1f" % SP["peak"]
+    peak_mark = "<b class=peak-mark id=peak-mark style='left:%.2f%%' title='%s'></b>" % (100.0 * min(1.0, SP["peak"] / tps_max), peak_label)
     lights = [("IGN", True, "green"), ("PROXY", True, "green"), (str(PROXY_PORT), True, "green"),
               ("LOCAL", True, "green"), ("CLOUD", False, "amber")]
     lights.extend(spark_temp_lights())
@@ -1936,6 +1989,7 @@ h2::before,h2::after{{content:"";flex:1;height:2px;background:linear-gradient(90
 .seg-on.warn{{background:var(--warn);border-color:#ffe066;box-shadow:0 0 5px rgba(255,204,0,.45);}}
 .seg-on.redline{{background:var(--redline);border-color:#ff8a6a;box-shadow:0 0 5px rgba(255,61,26,.5);}}
 .seg-off{{background:var(--unlit);border-color:var(--unlit-edge);}}
+.speed-track{{position:relative;}}.pk-short{{color:#ff8a6a;}}.speed-tach .speed-peak{{display:none;}}.peak-mark{{position:absolute;top:-4px;bottom:-4px;width:3px;margin-left:-1px;background:#ff3d1a;border-radius:1px;box-shadow:0 0 6px rgba(255,61,26,.9),0 0 12px rgba(255,61,26,.5);pointer-events:auto;}}.peak-mark::before{{content:'';position:absolute;top:-5px;left:-3px;border:4.5px solid transparent;border-top:5px solid #ff3d1a;}}.speed-peak{{font-size:10px;color:#ff8a6a;font-weight:800;letter-spacing:.06em;text-transform:uppercase;opacity:.9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .tach-scale{{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);font-weight:700;}}
 .speed-readout{{display:flex;align-items:baseline;justify-content:center;gap:8px;}}
 .speed-readout .big.dseg{{margin:0;font-size:clamp(22px,8vw,34px);}}
@@ -1998,13 +2052,14 @@ h2::before,h2::after{{content:"";flex:1;height:2px;background:linear-gradient(90
   <h2>Body count</h2>
   <div class=grid>
     <div class="card speed">
-      <div class=lbl>Annihilation speed (out tok/s)</div>
+      <div class=lbl id=speed-lbl>Annihilation speed (avg · ALL)</div>
       <div class=speed-stack>
-        <div class=tach-track>{tach}</div>
-        <div class=tach-scale>{tach_scale}</div>
+        <div class='tach-track speed-track' id=speed-tach>{tach}{peak_mark}</div>
+        <div class=tach-scale id=speed-scale>{tach_scale}</div>
+        <div class=speed-peak id=speed-peak>{peak_label}</div>
         <div class=speed-readout>
-          <div class="big dseg seg" data-val="{tps_disp}" data-ghost="{ghost_digits(tps_disp)}">{tps_disp}</div>
-          <div class=speed-unit>tok/s</div>
+          <div class="big dseg seg" id=speed-val data-val="{tps_disp}" data-ghost="{ghost_digits(tps_disp)}">{tps_disp}</div>
+          <div class=speed-unit>tok/s · <span class=pk-short id=speed-pk title='{peak_label}'>peak {peak_short}</span></div>
         </div>
       </div>
     </div>
@@ -2103,12 +2158,27 @@ function applyHero(d){{
     b.setAttribute('aria-selected', on?'true':'false');
   }});
 }}
+function applySpeed(s){{
+  var t=$('speed-tach'); if(!t||!s||s.error) return;
+  var segs=t.querySelectorAll('i'); var n=segs.length;
+  var lit=Math.round(Math.max(0,Math.min(1,s.live/s.scale))*n);
+  var wf=Math.floor(0.70*n), rf=Math.floor(0.85*n);
+  segs.forEach(function(el,i){{ el.className = i<lit ? (i>=rf?'seg-on redline':(i>=wf?'seg-on warn':'seg-on')) : 'seg-off'; }});
+  setDseg($('speed-val'), s.live_disp);
+  var pm=$('peak-mark'); if(pm){{ pm.style.left=(100*Math.min(1,s.peak/s.scale))+'%'; pm.title=s.peak_label; }}
+  var pl=$('speed-peak'); if(pl) pl.textContent=s.peak_label;
+  var lb=$('speed-lbl'); if(lb&&s.range_label) lb.textContent='Annihilation speed (avg · '+s.range_label+')';
+  var pk=$('speed-pk'); if(pk){{ pk.textContent='peak '+s.peak.toFixed(1); pk.title=s.peak_label; }}
+  var sc=$('speed-scale'); if(sc&&s.ticks) sc.innerHTML=s.ticks.map(function(v){{return '<span>'+v+'</span>';}}).join('');
+}}
+function pollSpeed(){{ fetch('/api/speed?range='+encodeURIComponent(curRange||'all'),{{cache:'no-store'}}).then(function(r){{return r.json();}}).then(applySpeed).catch(function(){{}}); }}
+setInterval(pollSpeed, 30000);
 var CKEY='tad-cloud';
 var cloudOn=localStorage.getItem(CKEY)==='1';
 var curRange=active;
 function paintCloud(){{ var b=$('cloud-tog'); if(!b) return; b.classList.toggle('on', cloudOn); b.setAttribute('aria-pressed', cloudOn?'true':'false'); }}
 function loadRange(range, save){{
-  curRange=range;
+  curRange=range; pollSpeed();
   fetch('/api/stats?range='+encodeURIComponent(range)+(cloudOn?'&cloud=1':''))
     .then(function(r){{ if(!r.ok) throw new Error('bad'); return r.json(); }})
     .then(function(d){{ applyHero(d); if(save!==false) localStorage.setItem(KEY, d.range); }})
@@ -2499,7 +2569,7 @@ def office2d_tokens_payload(n=7):
         c = db()
         try:
             q = lambda sql, *a: c.execute(sql, a).fetchall()
-            rows = devastation_day_rows(q, "source IN ('proxy','hermes-direct')", n)
+            rows = devastation_day_rows(q, "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local')", n)
         finally:
             c.close()
         m = {d: a + b for d, a, b in rows}
@@ -2536,7 +2606,7 @@ def office2d_tokens_payload(n=7):
         cloud = None
     return {"days": days, "cloud": cloud, "local": local,
             "cloud_sources": "codex per-day deltas from rollouts, cached input excluded + opencode cloud sessions; grok excluded (plan % only, no token counts)",
-            "codex_with_cached": [codex_raw.get(d) for d in days], "local_source": "stats.db requests source IN ('proxy','hermes-direct')", "now": time.time()}
+            "codex_with_cached": [codex_raw.get(d) for d in days], "local_source": "stats.db requests source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local')", "now": time.time()}
 
 def office_json_payload(since_sec=None):
     now = time.time()
@@ -2775,6 +2845,18 @@ class Dash(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "public, max-age=86400")
             self.send_header("Content-Length", str(len(b)))
             self.end_headers(); self.wfile.write(b); return
+        if path == "/api/speed":
+            try:
+                from urllib.parse import urlparse, parse_qs
+                _rk = (parse_qs(urlparse(self.path).query).get("range") or ["all"])[0]
+                payload = json.dumps(speed_payload(_rk)).encode(); code = 200
+            except Exception as e:
+                payload = json.dumps({"error": str(e)}).encode(); code = 500
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers(); self.wfile.write(payload); return
         if path == "/api/stats":
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
