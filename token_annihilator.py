@@ -1177,6 +1177,7 @@ def page():
     def seg_tach(n, frac, rising=True):
         frac = max(0.0, min(1.0, float(frac)))
         lit = int(round(frac * n))
+        if frac > 0 and lit == 0: lit = 1  # any usage lights at least one segment
         warn_from, red_from = int(0.70 * n), int(0.85 * n)
         parts = []
         for i in range(n):
@@ -1747,6 +1748,7 @@ def page_mobile():
     def seg_tach(n, frac, rising=True):
         frac = max(0.0, min(1.0, float(frac)))
         lit = int(round(frac * n))
+        if frac > 0 and lit == 0: lit = 1  # any usage lights at least one segment
         warn_from, red_from = int(0.70 * n), int(0.85 * n)
         parts = []
         for i in range(n):
