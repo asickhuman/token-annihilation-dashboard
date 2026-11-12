@@ -2559,6 +2559,87 @@ def _codex_daily_deltas(days):
                 continue
     return unc, raw
 
+def office2d_recent_payload(hours=168, limit=60):
+    """Recent finished work for /office2d idle replays, from vault files already written
+    by Spark jobs and ops notes (mtime + first heading). No model calls."""
+    vault = Path.home() / "obsidian-vault" / "output"
+    cutoff = time.time() - hours * 3600
+    items = []
+    def owner(kind, name):
+        n = name.lower()
+        if kind == "ops":
+            return "Token CEO"
+        if any(w in n for w in ("art", "boss-", "sprite", "comfy", "gallery", "style", "portrait", "tile")):
+            return "Zonk Bot"
+        return "Veil PM"
+    for kind in ("ops", "jobs"):
+        d = vault / kind
+        if not d.is_dir():
+            continue
+        for fp in d.rglob("*.md"):
+            try:
+                mt = fp.stat().st_mtime
+                if mt < cutoff or re.match(r"^\d{4}-\d{2}-\d{2}\.md$", fp.name):
+                    continue
+                title = ""
+                with open(fp, errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("#"):
+                            title = line.lstrip("#").strip(); break
+                if not title:
+                    title = fp.stem.replace("-", " ")
+                items.append({"bot": owner(kind, fp.name), "text": title[:70], "ts": mt})
+            except Exception:
+                continue
+    items.sort(key=lambda x: -x["ts"])
+    return {"items": items[:limit]}
+
+
+def office2d_roster_payload():
+    """Active bots for /office2d: this week's Grok per-bot share >= min_pct (from cloud_grok.json,
+    written by the Grok dashboard routine) plus any bot with a live office status event.
+    Floor comes from keyword rules in office2d/roles.json. No model calls."""
+    base = Path(__file__).resolve().parent
+    try:
+        roles = json.loads((base / "office2d" / "roles.json").read_text())
+    except Exception:
+        roles = {}
+    rules = roles.get("rules") or []
+    descs = dict(roles.get("desc") or {})
+    dflt = int(roles.get("default_floor") or 4)
+    min_pct = float(roles.get("min_pct") or 2)
+    try:
+        g = json.loads((Path.home() / ".token-annihilator" / "cloud_grok.json").read_text())
+    except Exception:
+        g = {}
+    active = {}
+    for b in g.get("bots") or []:
+        name = str(b.get("name") or "").strip()
+        if not name:
+            continue
+        if b.get("desc"):
+            descs[name] = str(b["desc"])
+        try:
+            pct = float(b.get("pct") or 0)
+        except Exception:
+            pct = 0.0
+        if pct >= min_pct:
+            active[name] = {"pct": pct, "why": "grok"}
+    for name in office_latest().keys():
+        active.setdefault(name, {"pct": None, "why": "status"})
+    def floor_for(name):
+        text = (name + " " + descs.get(name, "")).lower()
+        for r in rules:
+            if any(w in text for w in r.get("words") or []):
+                return int(r.get("floor") or dflt)
+        return dflt
+    out = []
+    for name, info in sorted(active.items(), key=lambda kv: -(kv[1]["pct"] or 0)):
+        out.append({"name": name, "floor": floor_for(name), "id": re.sub(r"\W+", "-", name.lower()).strip("-"),
+                    "pct": info["pct"], "why": info["why"]})
+    return {"updated": g.get("updated"), "min_pct": min_pct, "bots": out}
+
+
 def office2d_tokens_payload(n=7):
     """Read-only daily token series for /office2d finance screens. None = no data for that day."""
     from datetime import timedelta
@@ -2873,7 +2954,10 @@ class Dash(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers(); self.wfile.write(payload); return
 
-        if path == "/office3d" or path == "/office3d/":
+        if path == "/office3d" or path == "/office3d/" or path == "/office3d/index.html":
+            # 3D office retired Nov 11 2026 (Michael); files kept, page redirects to 2D.
+            self.send_response(302); self.send_header("Location", "/office2d"); self.send_header("Content-Length", "0"); self.end_headers(); return
+        if False:
             fp = office3d_safe_file("index.html")
             if fp is None:
                 self._send(404, b"office3d missing - generate index.html first", "text/plain; charset=utf-8"); return
@@ -2899,6 +2983,12 @@ class Dash(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers(); self.wfile.write(b); return
 
+        if path == "/office2d/recent.json":
+            b = json.dumps(office2d_recent_payload()).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+        if path == "/office2d/roster.json":
+            b = json.dumps(office2d_roster_payload()).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
         if path == "/office2d/tokens.json":
             b = json.dumps(office2d_tokens_payload()).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
