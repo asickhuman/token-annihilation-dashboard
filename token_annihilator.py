@@ -287,6 +287,10 @@ def cloud_total_tokens():
             grok_tok = int(round(float(grok["used_pct"]) * float(GROK_TOKENS_PER_PCT)))
     except Exception:
         grok_tok = 0
+    try:
+        grok_tok = max(grok_tok, grok_tokens_window())
+    except Exception:
+        pass
     codex = int(codex or 0)
     grok_tok = int(grok_tok or 0)
     return codex + grok_tok, codex, grok_tok
@@ -568,16 +572,35 @@ def load_cloud_providers(range_key="all"):
     status = pace.get("status") or ""
     weekly_reset = _fmt_reset(pace.get("secondary_resets_at") or secondary.get("resets_at"))
     primary_reset = _fmt_reset(primary.get("resets_at"))
+    # Stale guard: if a window's reset time already passed, the saved % is from an old
+    # window. Cloud Codex has not been used since; show 0% instead of the stale reading.
+    def _ts(v):
+        try:
+            v = float(v)
+            return v / 1000.0 if v > 1e12 else v
+        except Exception:
+            return None
+    _now = time.time()
+    _last_src = (rl or {}).get("_seen") or ""
+    _p_rs = _ts(primary.get("resets_at"))
+    _w_rs = _ts(pace.get("secondary_resets_at") or secondary.get("resets_at"))
+    if primary_pct is not None and _p_rs and _p_rs < _now:
+        primary_pct = 0.0
+        primary_reset = "window reset " + _fmt_reset(_p_rs) + " · no cloud use since"
+    if weekly_pct is not None and _w_rs and _w_rs < _now:
+        weekly_pct = 0.0
+        target = None
+        weekly_reset = "window reset " + _fmt_reset(_w_rs) + " · no cloud use since"
     today_tok, week_tok, _codex_all = _codex_session_token_totals()
     meters = []
     if primary_pct is not None:
         meters.append({
             "label": "5h window",
             "pct": primary_pct,
-            "detail": "resets " + primary_reset,
+            "detail": primary_reset if primary_reset.startswith("window reset") else "resets " + primary_reset,
         })
     if weekly_pct is not None:
-        detail = "resets " + weekly_reset
+        detail = weekly_reset if weekly_reset.startswith("window reset") else "resets " + weekly_reset
         if target:
             detail = "pace %s%% · %s · %s" % (target, status or "—", detail)
         meters.append({
@@ -947,14 +970,72 @@ def _codex_tokens_window(start_ts, end_ts):
         pass
     return int(total)
 
+def _grok_usage_segments():
+    """Grok usage as (start_ts, end_ts, pct) segments rebuilt from cloud_snapshots.jsonl.
+    Each refresh of cloud_grok.json is one point; the pct gained between points is spread
+    evenly over that interval. A new reset date means a new week: usage counts from the
+    old reset time. Pre-reset usage after the last pre-reset refresh is unknown (not counted)."""
+    pts = {}
+    try:
+        with open(CLOUD_SNAP_JSONL) as f:
+            for line in f:
+                try:
+                    g = (json.loads(line).get("grok") or {})
+                except Exception:
+                    continue
+                u = g.get("updated"); pct = g.get("used_pct")
+                if not u or pct is None or u in pts:
+                    continue
+                try:
+                    t = datetime.fromisoformat(u).timestamp()
+                except Exception:
+                    continue
+                pts[u] = (t, float(pct), str(g.get("resets") or ""))
+    except Exception:
+        return []
+    def _reset_ts(label, year):
+        try:
+            txt = label.replace(" ET", "").strip()
+            return datetime.strptime("%s %d" % (txt, year), "%a %b %d, %I:%M %p %Y").timestamp()
+        except Exception:
+            return None
+    seq = sorted(pts.values())
+    segs = []
+    prev = None
+    for t, pct, rs in seq:
+        yr = datetime.fromtimestamp(t).year
+        if prev is None or rs != prev[2]:
+            rts = _reset_ts(rs, yr)
+            start = (rts - 7 * 86400) if rts else t
+            if prev is not None:
+                start = max(start, prev[0])
+            if pct > 0:
+                segs.append((min(start, t), t, pct))
+        elif pct > prev[1]:
+            segs.append((prev[0], t, pct - prev[1]))
+        prev = (t, pct, rs)
+    return segs
+
+def grok_tokens_window(s_ts=None, e_ts=None):
+    """Estimated Grok tokens (pct x GROK_TOKENS_PER_PCT) used inside [s_ts, e_ts)."""
+    tot = 0.0
+    for a, b, pct in _grok_usage_segments():
+        lo = a if s_ts is None else max(a, s_ts)
+        hi = b if e_ts is None else min(b, e_ts)
+        if hi <= lo and not (b == a and (s_ts is None or s_ts <= a) and (e_ts is None or a < e_ts)):
+            continue
+        frac = 1.0 if b <= a else max(0.0, (hi - lo) / (b - a))
+        tot += pct * frac
+    return int(round(tot * float(GROK_TOKENS_PER_PCT)))
+
 def cloud_tokens_range(range_key="all", window=None):
     """Cloud tokens by serving model: Codex (uncached in + out) + OpenCode DeepSeek (in + out + reasoning, cache reads excluded).
-    Grok is excluded: it only reports a usage percentage, not tokens."""
+    Grok is included as an estimate: pct gained between refreshes x GROK_TOKENS_PER_PCT."""
     if window is not None:
         s_ts, e_ts = window
         codex = _codex_tokens_window(s_ts, e_ts)
         ds = _opencode_window_tokens(int(s_ts * 1000), int(e_ts * 1000), "deepseek")
-        return codex + ds, codex, ds
+        return codex + ds + grok_tokens_window(s_ts, e_ts), codex, ds
     key, s_ms, e_ms = _opencode_range_bounds_ms(range_key)
     if s_ms is None:
         try:
@@ -964,7 +1045,8 @@ def cloud_tokens_range(range_key="all", window=None):
     else:
         codex = _codex_tokens_window(s_ms / 1000.0, e_ms / 1000.0)
     ds = int(_opencode_agg(key, bucket="deepseek").get("tot") or 0)
-    return codex + ds, codex, ds
+    gk = grok_tokens_window(None if s_ms is None else s_ms / 1000.0, None if s_ms is None else e_ms / 1000.0)
+    return codex + ds + gk, codex, ds
 
 
 def _opencode_window_tokens(s_ms, e_ms, bucket):
@@ -1041,6 +1123,7 @@ def stats_payload(range_key="all", cloud=False):
     return {
         "cloud": bool(cloud), "local_tot": local_tot, "cloud_tot": cloud_tot,
         "cloud_codex": codex_t, "cloud_deepseek": ds_t,
+        "cloud_grok": (cloud_tot - (codex_t or 0) - (ds_t or 0)) if cloud_tot is not None else None,
         "range": key, "short": short, "hero_label": hero_lbl, "subtitle": subtitle,
         "start": start, "end": end,
         "tin": tin, "tout": tout, "tot": tot, "nreq": nreq,
@@ -1061,7 +1144,7 @@ def speed_payload(range_key="all"):
         lo = (lo_ms / 1000.0) if lo_ms is not None else 0.0
         hi = (hi_ms / 1000.0) if hi_ms is not None else now + 1
         r = c.execute(f"SELECT SUM(output_tokens), SUM(eval_s), COUNT(*) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0 AND ts>=? AND ts<?", (lo, hi)).fetchone()
-        pk = c.execute(f"SELECT CAST(output_tokens AS REAL)/eval_s AS t, ts, model FROM requests WHERE {P} AND eval_s>=2 AND output_tokens>=64 ORDER BY t DESC LIMIT 1").fetchone()
+        pk = c.execute(f"SELECT CAST(output_tokens AS REAL)/eval_s AS t, ts, CASE WHEN model='Qwen3.8-Flash-Next' OR lower(model)='qwen3.8-flash-next-fp4' THEN 'Qwen3.8 Flash FP4 (TensorFold)' WHEN lower(model)='qwen3.8-flash-next-iq3_s' THEN 'Qwen3.8 Flash IQ3_S (Strata)' ELSE COALESCE(model,'?') END FROM requests WHERE {P} AND eval_s>=2 AND output_tokens>=64 ORDER BY t DESC LIMIT 1").fetchone()
     finally:
         c.close()
     live = (float(r[0]) / float(r[1])) if (r and r[1]) else 0.0
@@ -1089,7 +1172,7 @@ def range_tabs_html(active="all", include_mobile=False, include_cloud=False):
             % (on, key, "true" if key == active else "false", title, short)
         )
     if include_cloud:
-        btns.append('<button type="button" class="rtab ctog" id="cloud-tog" aria-pressed="false" title="Add cloud tokens (Codex + DeepSeek) to the local total">+ CLOUD</button>')
+        btns.append('<button type="button" class="rtab ctog" id="cloud-tog" aria-pressed="false" title="Add cloud tokens (Codex + DeepSeek + Grok est.) to the local total">+ CLOUD</button>')
     if include_mobile:
         btns.append('<a class="rtab rtab-link" href="/m" title="Open mobile view">MOBILE</a>')
     return "".join(btns)
@@ -1171,7 +1254,7 @@ def page():
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
-    models = q(f"SELECT COALESCE(model,'?'), SUM(COALESCE(request_count,1)), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 40")
+    models = q(f"SELECT CASE WHEN model='Qwen3.8-Flash-Next' OR lower(model)='qwen3.8-flash-next-fp4' THEN 'Qwen3.8 Flash FP4 (TensorFold)' WHEN lower(model)='qwen3.8-flash-next-iq3_s' THEN 'Qwen3.8 Flash IQ3_S (Strata)' ELSE COALESCE(model,'?') END, SUM(COALESCE(request_count,1)), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 40")
     cal = calendar(c); c.close()
     try: prices = json.load(open(PRICES))["models"]
     except Exception: prices = []
@@ -1742,7 +1825,7 @@ def page_mobile():
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
-    models = q(f"SELECT COALESCE(model,'?'), SUM(COALESCE(request_count,1)), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 3")
+    models = q(f"SELECT CASE WHEN model='Qwen3.8-Flash-Next' OR lower(model)='qwen3.8-flash-next-fp4' THEN 'Qwen3.8 Flash FP4 (TensorFold)' WHEN lower(model)='qwen3.8-flash-next-iq3_s' THEN 'Qwen3.8 Flash IQ3_S (Strata)' ELSE COALESCE(model,'?') END, SUM(COALESCE(request_count,1)), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 3")
     cal = calendar(c); c.close()
     try: prices = json.load(open(PRICES))["models"]
     except Exception: prices = []
