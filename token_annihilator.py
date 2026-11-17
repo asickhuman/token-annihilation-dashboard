@@ -1038,10 +1038,8 @@ def cloud_tokens_range(range_key="all", window=None):
         return codex + ds + grok_tokens_window(s_ts, e_ts), codex, ds
     key, s_ms, e_ms = _opencode_range_bounds_ms(range_key)
     if s_ms is None:
-        try:
-            codex = int(_codex_session_token_totals()[2] or 0)
-        except Exception:
-            codex = 0
+        # Same basis as every other range: uncached input + output (was total incl. cache reads).
+        codex = _codex_tokens_window(0, time.time() + 60)
     else:
         codex = _codex_tokens_window(s_ms / 1000.0, e_ms / 1000.0)
     ds = int(_opencode_agg(key, bucket="deepseek").get("tot") or 0)
@@ -2295,7 +2293,7 @@ def page_cloud(mobile=False, range_key="all"):
         elif _p.get("id") == "codex":
             cov_bits.append("Codex: today/week/all + rolling 24H from rollout event deltas; other tabs approximate")
         elif _p.get("id") == "grok":
-            cov_bits.append("Grok: current snapshot only; historical ranges filling via cloud_snapshots.jsonl")
+            cov_bits.append("Grok: estimated tokens from % gained between refreshes (~2.81M per 1%), counted in every range")
     range_cov = " · ".join(cov_bits)
     range_tabs = range_tabs_html(rk, include_mobile=False)
     if rk == "dod":
@@ -2303,24 +2301,39 @@ def page_cloud(mobile=False, range_key="all"):
             if _p.get("id") == "codex":
                 _p["stats"] = [s for s in (_p.get("stats") or []) if s.get("label") == "24H tok"]
             if _p.get("id") == "grok":
-                _p["note"] = ((_p.get("note") or "") + " · snapshot=current (no rolling token counts)").strip(" ·")
+                pass
     elif rk == "today":
         for _p in providers:
             if _p.get("id") == "codex":
                 _p["stats"] = [s for s in (_p.get("stats") or []) if s.get("label") == "Today tok"]
             if _p.get("id") == "grok":
-                _p["note"] = ((_p.get("note") or "") + " · snapshot=current").strip(" ·")
+                pass
     elif rk not in ("all", "weekly"):
         for _p in providers:
             if _p.get("id") == "grok":
-                _p["note"] = ((_p.get("note") or "") + " · snapshot=current (filling)").strip(" ·")
+                pass
 
+    # Hero follows the selected range tab (was always all-time).
+    try:
+        if rk == "dod":
+            _now = time.time()
+            cloud_tot, _codex_tot, _ds_tot = cloud_tokens_range(window=(_now - 86400, _now))
+        else:
+            cloud_tot, _codex_tot, _ds_tot = cloud_tokens_range(rk)
+    except Exception:
+        cloud_tot, _codex_tot, _grok_tot = cloud_total_tokens()
+    _grok_rng = max(0, int(cloud_tot or 0) - int(_codex_tot or 0) - int(_ds_tot or 0)) if "_ds_tot" in locals() else None
+    if _grok_rng is not None:
+        for _p in providers:
+            if _p.get("id") == "grok":
+                _lbl = {"today": "Today", "dod": "24H", "weekly": "7D", "mtd": "MTD", "monthly": "30D", "yearly": "YTD"}.get(rk, "All")
+                _p["stats"] = [{"label": _lbl + " tok (est.)", "value": _grok_rng}]
+    hero_lbl_cloud = "TOTAL CLOUD TOKENS · " + {"today": "TODAY", "dod": "24H", "weekly": "7D", "mtd": "MTD", "monthly": "30D", "yearly": "YTD"}.get(rk, "ALL TIME")
     cards = render_cloud_usage_cards(providers, compact=bool(mobile), show_stats=True)
-    cloud_tot, _codex_tot, _grok_tot = cloud_total_tokens()
     tot_s = fmt(cloud_tot)
     tot_ghost = ghost_digits(tot_s)
     odo_fs = "clamp(18px,6.6vw,34px)" if mobile else "clamp(26px,3.6vw,56px)"
-    T = "DGX Cloud Usage"
+    T = "Cloud Usage"
     back_href = "/m" if mobile else "/"
     back_lbl = "LOCAL"
     # desktop uses range-tab look; mobile matches /m rtab
@@ -2496,14 +2509,14 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 <div class=hdr>
   <h1>{T}</h1>
 </div>
-<div class=tagline>Non-Spark cloud spend and quota · Codex / GPT · Grok Bot · DeepSeek (via OpenCode) · refreshed {datetime.now():%b %d %H:%M}.</div>
+<div class=tagline>Cloud spend and quota (off the Spark) · Codex / GPT · Grok Bot · DeepSeek (via OpenCode) · refreshed {datetime.now():%b %d %H:%M}.</div>
 <div class=hero>
   <div class="view-tog" aria-label="Desktop or mobile">
     <a class="vtab{" on" if not mobile else ""}" href="/cloud" title="Desktop cloud">DESKTOP</a>
     <a class="vtab{" on" if mobile else ""}" href="/cloud/m" title="Mobile cloud">MOBILE</a>
   </div>
   <nav class="range-tog" role="tablist" aria-label="Time range">{range_tabs}</nav>
-  <div class=odo-lbl>TOTAL CLOUD TOKENS</div>
+  <div class=odo-lbl>{hero_lbl_cloud}</div>
   <div class="odo dseg seg" id=hero-odo data-val="{tot_s}" data-ghost="{tot_ghost}">{tot_s}</div>
 </div>
 <div class="panel cluse">
