@@ -102,7 +102,7 @@ def _temp_light(kind, temp_c, warn_c, hot_c):
 def _ram_light(avail_pct):
     if avail_pct is None:
         return ("RAM --%", False, "amber")
-    p = int(round(avail_pct))
+    p = int(round(100.0 - avail_pct))
     label = "RAM %d%%" % p
     if avail_pct < RAM_AVAIL_CRIT_PCT:
         return (label, True, "red")
@@ -117,6 +117,839 @@ def spark_temp_lights():
         _ram_light(_read_ram_avail_pct()),
     ]
 
+
+JOBS_LOG_DIR = os.path.expanduser("~/obsidian-vault/output/jobs")
+HERMES_INBOX = os.path.expanduser("~/hermes-inbox")
+JOBS_CACHE_SEC = 15
+_jobs_cache = {"t": 0.0, "data": None}
+_jobs_cache_lock = threading.Lock()
+
+_RE_JOBS_RICH = re.compile(
+    r"^-\s+(?:(\d{4}-\d{2}-\d{2})\s+)?(\d{1,2}:\d{2}(?::\d{2})?)\s+([AP]M\s+ET|[A-Z]{2,4})\s+"
+    r"\[([^\]]+)\]\s+(\S+)",
+    re.I,
+)
+_RE_JOBS_STRUCT = re.compile(
+    r"^-\s+(\d{1,2}:\d{2}:\d{2})\s+(\S+)\s+\|\s+job=`([^`]+)`\s+\|\s+status=`([^`]+)`",
+    re.I,
+)
+_RE_HANDLER_FINISH = re.compile(
+    r"handler-finish|handler_finish|handler finished",
+    re.I,
+)
+_SKIP_JOB_IDS = {"stuck-check", "stuck_check", "veil-pm"}
+_DONE_STATUSES = {
+    "done", "done-no-tests", "local-done", "done-by-grok", "done-stale-closed",
+    "merged", "findings", "finished", "pass", "ok", "success",
+}
+_FAIL_STATUSES = {
+    "failed", "local-failed", "failed-parse-bug", "fail",
+}
+_DONE_KINDS = {
+    "merged", "findings", "finished", "done", "handler-finish", "handler_finish",
+}
+_WAIT_RE = re.compile(r"waiting for predecessor|still waiting for ", re.I)
+_WORK_RE = re.compile(
+    r"\[opencode-job|launching OpenCode|codex exec|==== \S+ start |model_used=|falling back to ",
+    re.I,
+)
+
+
+def _now_et():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        from datetime import timezone, timedelta
+        return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-5)))
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _short_job(job):
+    return re.sub(r"-\d{8}$", "", job or "") or (job or "?")
+
+
+def _model_kind(model):
+    """LOCAL vs CLOUD. Codex counts as cloud. spark-ollama/spark-local/TensorFold/Strata/Ollama are local."""
+    m = (model or "").strip()
+    low = m.lower()
+    if not m or m == "?":
+        return "unknown"
+    if low == "scripted":
+        return "scripted"
+    if (
+        low.startswith("spark-ollama/")
+        or low.startswith("spark-local/")
+        or low.startswith("ollama/")
+        or "tensorfold" in low
+        or "strata" in low
+        or "iq3_s" in low
+        or re.search(r"(?:^|/)qwen3\.8-flash-next-fp4(?:$|\s)", low)
+        or re.search(r"(?:^|[/_-])fp4(?:$|[/_-])", low)
+        or (":" in low and ("ollama" in low or re.search(r":\d+b\b", low)))
+    ):
+        return "local"
+    if (
+        low.startswith("opencode/")
+        or "deepseek" in low
+        or "codex" in low
+        or low.startswith("gpt-")
+        or low.startswith("o3")
+        or low.startswith("o4")
+        or "claude" in low
+    ):
+        return "cloud"
+    return "unknown"
+
+
+def _kind_label(kind):
+    return {"local": "LOCAL", "cloud": "CLOUD", "scripted": "SCRIPT"}.get(kind, "")
+
+
+def _short_model(model):
+    m = (model or "").strip() or "?"
+    low = m.lower()
+    known = {
+        "opencode/deepseek-v4.1-flash-free": "DeepSeek v4.1 Flash",
+        "deepseek-v4.1-flash-free": "DeepSeek v4.1 Flash",
+        "spark-local/qwen3.8-flash-next-iq3_s": "Qwen3.8 Flash IQ3_S",
+        "qwen3.8-flash-next-iq3_s": "Qwen3.8 Flash IQ3_S",
+        "spark-local/qwen3.8-flash-next-fp4": "Qwen3.8 Flash FP4",
+        "qwen3.8-flash-next-fp4": "Qwen3.8 Flash FP4",
+        "spark-ollama/qwen3.8:27b": "Qwen3.8 27B",
+        "qwen3.8:27b": "Qwen3.8 27B",
+        "scripted": "scripted",
+    }
+    if low in known:
+        return known[low]
+    if "/" in m:
+        return m.split("/", 1)[1]
+    return m
+
+
+def _fmt_runtime(seconds):
+    try:
+        seconds = int(max(0, seconds))
+    except Exception:
+        return "?"
+    if seconds < 60:
+        return "%ds" % seconds
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return "%dm" % m
+    h, m = divmod(m, 60)
+    return "%dh %dm" % (h, m)
+
+
+def _parse_iso_ts(s):
+    if not s:
+        return None
+    s = str(s).strip()
+    if re.search(r"[+-]\d{4}$", s):
+        s = s[:-2] + ":" + s[-2:]
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            try:
+                from zoneinfo import ZoneInfo
+                dt = dt.replace(tzinfo=ZoneInfo("America/New_York"))
+            except Exception:
+                pass
+        return dt
+    except Exception:
+        return None
+
+
+def _read_text(path, n=None):
+    try:
+        p = Path(path)
+        if not p.is_file():
+            return ""
+        if n is None:
+            return p.read_text(errors="replace")
+        size = p.stat().st_size
+        with open(p, "rb") as f:
+            if size > n:
+                f.seek(size - n)
+            return f.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _read_job_model(job, fallback=None):
+    """Prefer final model_used=; else the last 'falling back to <model>' target."""
+    batch = Path(CODEXQ_ROOT) / "batch" / job
+    logp = batch / "logs" / "runner.log"
+    joblog = Path(CODEXQ_ROOT) / "logs" / (job + ".log")
+    txt = _read_text(logp, 40000)
+    if joblog.is_file():
+        txt = txt + "\n" + _read_text(joblog, 20000)
+    used = None
+    if txt:
+        ms = re.findall(r"model_used=(\S+)", txt)
+        if ms:
+            used = ms[-1].rstrip(",;")
+        if not used:
+            fb = re.findall(r"falling back to (\S+)", txt, re.I)
+            if fb:
+                used = fb[-1].rstrip(",;")
+        if not used:
+            ms = re.findall(r"\[opencode-job[^\]]*\] model=(\S+)", txt)
+            if ms:
+                used = ms[-1].rstrip(",;")
+    if not used:
+        try:
+            used = (batch / "model").read_text(errors="replace").strip() or None
+        except Exception:
+            used = None
+    return used or fallback or "?"
+
+
+def _fallback_failed(job):
+    """True if runner.log fell back to a local model and that attempt then failed."""
+    txt = _read_text(Path(CODEXQ_ROOT) / "batch" / job / "logs" / "runner.log", 40000)
+    if not txt:
+        txt = _read_text(Path(CODEXQ_ROOT) / "logs" / (job + ".log"), 20000)
+    if not txt:
+        return False
+    idx = -1
+    for m in re.finditer(r"falling back to (spark-local|spark-ollama)\S*", txt, re.I):
+        idx = m.start()
+    if idx < 0:
+        return False
+    rest = txt[idx:]
+    if re.search(r"connection refused|HTTP 502|HTTP 5\d\d", rest, re.I):
+        return True
+    exits = re.findall(r"exit=(\d+)", rest)
+    if exits:
+        try:
+            return int(exits[-1]) != 0
+        except Exception:
+            return True
+    return bool(re.search(r"fallback attempt \d+ rc=[1-9]", rest))
+
+
+def _is_waiting(job):
+    """True when the job wrapper is alive but still waiting on a predecessor."""
+    logs = Path(CODEXQ_ROOT) / "logs" / (job + ".log")
+    runner = Path(CODEXQ_ROOT) / "batch" / job / "logs" / "runner.log"
+    txt = _read_text(logs, 20000)
+    if runner.is_file():
+        txt = txt + "\n" + _read_text(runner, 20000)
+    if not txt:
+        return False
+    wait_pos = -1
+    for m in _WAIT_RE.finditer(txt):
+        wait_pos = m.start()
+    if wait_pos < 0:
+        return False
+    work_pos = -1
+    for m in _WORK_RE.finditer(txt):
+        work_pos = m.start()
+    return work_pos < wait_pos
+
+
+def _iter_queue_latest():
+    path = Path(CODEXQ_ROOT) / "queue.jsonl"
+    latest = {}
+    order = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(o, dict):
+                    continue
+                jid = o.get("id") or o.get("job")
+                if not jid:
+                    continue
+                if jid not in latest:
+                    order.append(jid)
+                latest[jid] = o
+    except Exception:
+        return
+    for jid in order:
+        yield jid, latest[jid]
+
+
+def _runtime_s(started, now=None):
+    now = now or _now_et()
+    if not started:
+        return 0
+    try:
+        st = started
+        if getattr(st, "tzinfo", None) is None:
+            try:
+                from zoneinfo import ZoneInfo
+                st = st.replace(tzinfo=ZoneInfo("America/New_York"))
+            except Exception:
+                pass
+        return max(0, int((now - st).total_seconds()))
+    except Exception:
+        return 0
+
+
+def _collect_live():
+    """Split live codexq jobs into running (model producing output) vs queued/waiting."""
+    now = _now_et()
+    found = {}
+    logs = Path(CODEXQ_ROOT) / "logs"
+
+    def add(job, started=None, model=None, src=""):
+        if not job or job in _SKIP_JOB_IDS:
+            return
+        rec = found.get(job) or {"name": job, "model": None, "started": None, "src": src}
+        if started and not rec.get("started"):
+            rec["started"] = started
+        if model and (not rec.get("model") or rec.get("model") == "?"):
+            rec["model"] = model
+        rec["src"] = rec.get("src") or src
+        found[job] = rec
+
+    try:
+        for pidf in logs.glob("*.pid"):
+            job = pidf.name[:-4]
+            try:
+                pid = pidf.read_text(errors="replace").strip()
+            except Exception:
+                continue
+            if not pid.isdigit() or not _pid_alive(pid):
+                continue
+            add(job, started=datetime.fromtimestamp(pidf.stat().st_mtime), src="pid")
+    except Exception:
+        pass
+
+    for job, o in (_iter_queue_latest() or []):
+        st = (o.get("status") or "").lower()
+        if st in ("queued", "pending", "waiting", "local-queued"):
+            add(job, started=_parse_iso_ts(o.get("started")), model=o.get("model"), src="queue-wait")
+            found[job]["force_queued"] = True
+            continue
+        if st not in ("running", "local-running"):
+            continue
+        pid = None
+        try:
+            raw = (logs / (job + ".pid")).read_text(errors="replace").strip()
+            if raw.isdigit():
+                pid = raw
+        except Exception:
+            pid = str(o.get("pid") or "") or None
+            if pid and not str(pid).isdigit():
+                pid = None
+        hook = logs / (job + ".hook-status")
+        if hook.is_file() and (not pid or not _pid_alive(pid)):
+            continue
+        add(job, started=_parse_iso_ts(o.get("started")), model=o.get("model"), src="queue")
+
+    running, queued = [], []
+    for job, rec in found.items():
+        model = _read_job_model(job, rec.get("model"))
+        kind = _model_kind(model)
+        runtime_s = _runtime_s(rec.get("started"), now)
+        waiting = bool(rec.get("force_queued")) or _is_waiting(job)
+        item = {
+            "name": job,
+            "short": _short_job(job),
+            "model": model,
+            "model_short": _short_model(model),
+            "kind": kind,
+            "kind_label": _kind_label(kind),
+            "runtime_s": runtime_s,
+            "runtime": _fmt_runtime(runtime_s),
+            "fallback_failed": _fallback_failed(job) if not waiting else False,
+            "status": "queued" if waiting else "running",
+        }
+        if waiting:
+            queued.append(item)
+        else:
+            running.append(item)
+    running.sort(key=lambda r: -r["runtime_s"])
+    queued.sort(key=lambda r: -r["runtime_s"])
+    return running, queued
+
+
+def _class_from_event(status=None, kind=None, text=""):
+    k = (kind or "").strip().lower()
+    s = (status or "").strip().lower()
+    blob = text or ""
+    if _RE_HANDLER_FINISH.search(k) or _RE_HANDLER_FINISH.search(blob):
+        # e.g. handler-finish done / finished
+        if re.search(r"\bfail", k + " " + s + " " + blob, re.I) and not re.search(
+            r"\b(done|finished|pass|merged|success)\b", blob, re.I
+        ):
+            return "failed"
+        return "done"
+    if k in ("merged",) or s == "merged":
+        return "merged"
+    if k in _DONE_KINDS:
+        return "done"
+    if k in ("fail", "failed") or s in _FAIL_STATUSES or (s and s.startswith("fail")):
+        return "failed"
+    if s in _DONE_STATUSES or (s and s.startswith("done")) or s in ("pass", "finished", "ok", "success"):
+        return "done"
+    if s:
+        return s
+    if k:
+        return k
+    return "unknown"
+
+
+def _hm_from_parts(hm, tz):
+    tdisp = tsort = None
+    try:
+        am = re.search(r"[AP]M", tz or "", re.I)
+        if am:
+            ampm = am.group(0).upper()
+            parts = hm.split(":")
+            hh = parts[0].zfill(2)
+            mm = (parts[1] if len(parts) > 1 else "00")
+            dt = datetime.strptime("%s:%s %s" % (hh, mm, ampm), "%I:%M %p")
+            tdisp = dt.strftime("%-I:%M %p")
+            tsort = dt.strftime("%H:%M:%S")
+        else:
+            parts = hm.split(":")
+            if len(parts) == 2:
+                tsort = "%s:%s:00" % (parts[0].zfill(2), parts[1])
+            else:
+                tsort = hm if len(hm.split(":")) == 3 else (hm + ":00")
+            tdisp = datetime.strptime(tsort, "%H:%M:%S").strftime("%-I:%M %p")
+    except Exception:
+        tdisp = hm
+        tsort = hm
+    return tdisp, tsort
+
+
+def _parse_jobs_log(text, today):
+    """Parse the day's jobs md. Latest event per job id wins (failed-then-done is done)."""
+    jobs = {}
+    today_s = today.isoformat() if hasattr(today, "isoformat") else str(today)
+    seq = 0
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line.startswith("-"):
+            continue
+        seq += 1
+        job = status = kind = tdisp = None
+        tsort = None
+        m = _RE_JOBS_STRUCT.match(line)
+        if m:
+            hhmmss, tz, job, status = m.group(1), m.group(2), m.group(3), m.group(4)
+            try:
+                tdisp = datetime.strptime(hhmmss, "%H:%M:%S").strftime("%-I:%M %p")
+            except Exception:
+                tdisp = hhmmss
+            tsort = hhmmss
+        else:
+            m = _RE_JOBS_RICH.match(line)
+            if not m:
+                # handler-finish lines that don't match the usual rich shape
+                if _RE_HANDLER_FINISH.search(line):
+                    jm = re.search(r"job=`([^`]+)`|\[([^\]]+)\]", line)
+                    job = (jm.group(1) or jm.group(2)) if jm else None
+                    sm = re.search(r"status=`([^`]+)`", line)
+                    status = sm.group(1) if sm else None
+                    kind = "handler-finish"
+                    tm = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)", line)
+                    if tm:
+                        tdisp, tsort = _hm_from_parts(tm.group(1), line)
+                else:
+                    continue
+            else:
+                day, hm, tz, job, kind = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+                if day and day != today_s:
+                    continue
+                tdisp, tsort = _hm_from_parts(hm, tz)
+        if not job or job.lower() in _SKIP_JOB_IDS:
+            continue
+        cls = _class_from_event(status, kind, line)
+        ev = {
+            "name": job,
+            "short": _short_job(job),
+            "status": cls,
+            "raw_status": status,
+            "kind": kind,
+            "time": tdisp,
+            "sort": tsort or "",
+            "seq": seq,
+        }
+        prev = jobs.get(job)
+        # File order wins: a later line (FAIL then done / handler-finish) is the latest status.
+        if prev is None or (ev.get("seq") or 0) >= (prev.get("seq") or 0):
+            jobs[job] = ev
+    # Attach model / fallback on finished jobs
+    for job, ev in jobs.items():
+        model = _read_job_model(job, None)
+        ev["model"] = model
+        ev["model_short"] = _short_model(model)
+        ev["kind_loc"] = _model_kind(model)
+        ev["kind_label"] = _kind_label(ev["kind_loc"])
+        ev["fallback_failed"] = _fallback_failed(job)
+    done = sum(1 for ev in jobs.values() if ev["status"] in ("done", "merged"))
+    failed = sum(1 for ev in jobs.values() if ev["status"] == "failed")
+    last = None
+    for ev in jobs.values():
+        if last is None or (ev.get("seq") or 0) >= (last.get("seq") or 0):
+            last = ev
+    fallback_n = sum(1 for ev in jobs.values() if ev.get("fallback_failed") and ev["status"] == "failed")
+    return {
+        "done": done,
+        "failed": failed,
+        "total": len(jobs),
+        "last": last,
+        "fallback_n": fallback_n,
+        "jobs": jobs,
+    }
+
+
+def _inbox_latest_today(today):
+    """Latest hermes-inbox event per job for today (skips notify-receipt / locks)."""
+    out = {}
+    root = Path(HERMES_INBOX)
+    if not root.is_dir():
+        return out
+    prefix = today.strftime("%Y%m%d") + "-"
+    try:
+        paths = list(root.glob(prefix + "*.json"))
+    except Exception:
+        return out
+    for p in paths:
+        name = p.name
+        if "notify-receipt" in name or name.endswith(".lock") or ".dedup." in name:
+            continue
+        try:
+            o = json.loads(_read_text(p))
+        except Exception:
+            continue
+        if not isinstance(o, dict):
+            continue
+        job = o.get("job") or o.get("job_id")
+        if not job:
+            continue
+        st = o.get("status") or o.get("reported_status") or o.get("result") or ""
+        ended = str(o.get("ended") or "")
+        # filename stamp 20261118-153905 is sortable
+        stamp = name[:15]
+        rec = {"status": _class_from_event(st, None, st), "ended": ended, "sort": stamp, "raw": st, "time": None}
+        ts = _parse_iso_ts(ended)
+        if ts:
+            try:
+                rec["time"] = ts.strftime("%-I:%M %p")
+                rec["sort"] = ts.strftime("%H:%M:%S")
+            except Exception:
+                pass
+        prev = out.get(job)
+        if prev is None or rec["sort"] >= (prev.get("sort") or ""):
+            out[job] = rec
+    return out
+
+
+def _apply_inbox(today_info, inbox):
+    """If a later inbox / handler event marks a job done, that wins over an earlier FAIL."""
+    jobs = today_info.get("jobs") or {}
+    for job, ev in inbox.items():
+        if not ev or ev.get("status") not in ("done", "merged", "failed"):
+            continue
+        prev = jobs.get(job)
+        if prev is None:
+            rec = {
+                "name": job, "short": _short_job(job), "status": ev["status"],
+                "raw_status": ev.get("raw"), "kind": "inbox",
+                "time": ev.get("time"), "sort": ev.get("sort") or "", "seq": 10**9,
+            }
+            model = _read_job_model(job, None)
+            rec["model"] = model
+            rec["model_short"] = _short_model(model)
+            rec["kind_loc"] = _model_kind(model)
+            rec["kind_label"] = _kind_label(rec["kind_loc"])
+            rec["fallback_failed"] = _fallback_failed(job)
+            jobs[job] = rec
+            continue
+        # later-or-equal done overrides earlier failed
+        newer = (ev.get("sort") or "") >= (prev.get("sort") or "")
+        if ev["status"] in ("done", "merged") and (newer or prev.get("status") == "failed"):
+            if newer or ev["status"] in ("done", "merged"):
+                prev["status"] = ev["status"]
+                if ev.get("time"):
+                    prev["time"] = ev["time"]
+                if newer:
+                    prev["sort"] = ev.get("sort") or prev.get("sort")
+                prev["kind"] = prev.get("kind") or "inbox"
+    today_info["jobs"] = jobs
+    today_info["done"] = sum(1 for ev in jobs.values() if ev["status"] in ("done", "merged"))
+    today_info["failed"] = sum(1 for ev in jobs.values() if ev["status"] == "failed")
+    today_info["total"] = len(jobs)
+    last = None
+    for ev in jobs.values():
+        if last is None or (ev.get("seq") or 0) >= (last.get("seq") or 0):
+            last = ev
+    today_info["last"] = last
+    today_info["fallback_n"] = sum(
+        1 for ev in jobs.values() if ev.get("fallback_failed") and ev["status"] == "failed"
+    )
+    return today_info
+
+
+def _job_lines(running, queued, finished, limit=5):
+    """Running first, then queued, then latest finished, up to `limit` lines."""
+    lines = []
+    for r in running:
+        lines.append({
+            "name": r["name"], "short": r["short"], "status": "running",
+            "kind_label": r.get("kind_label") or "", "when": r.get("runtime") or "",
+            "model": r.get("model"), "fallback_failed": r.get("fallback_failed"),
+        })
+    for r in queued:
+        lines.append({
+            "name": r["name"], "short": r["short"], "status": "queued",
+            "kind_label": r.get("kind_label") or "", "when": r.get("runtime") or "",
+            "model": r.get("model"), "fallback_failed": False,
+        })
+    # latest finished not already listed
+    seen = {x["name"] for x in lines}
+    rest = [e for e in finished if e["name"] not in seen]
+    rest.sort(key=lambda e: (e.get("sort") or "", e.get("seq") or 0), reverse=True)
+    for e in rest:
+        if len(lines) >= limit:
+            break
+        lines.append({
+            "name": e["name"], "short": e.get("short") or _short_job(e["name"]),
+            "status": e.get("status") or "?",
+            "kind_label": e.get("kind_label") or "",
+            "when": e.get("time") or "",
+            "model": e.get("model"),
+            "fallback_failed": e.get("fallback_failed"),
+        })
+    return lines[:limit]
+
+
+def _spark_jobs_compute():
+    today = _today_et()
+    running, queued = _collect_live()
+    log_path = Path(JOBS_LOG_DIR) / ("%s.md" % today.isoformat())
+    today_info = {
+        "done": 0, "failed": 0, "total": 0, "last": None, "fallback_n": 0,
+        "jobs": {}, "missing": False,
+    }
+    try:
+        if not log_path.is_file():
+            today_info["missing"] = True
+        else:
+            today_info.update(_parse_jobs_log(_read_text(log_path), today))
+            today_info["missing"] = False
+            today_info = _apply_inbox(today_info, _inbox_latest_today(today))
+    except Exception:
+        today_info["missing"] = True
+    live_ids = {r["name"] for r in running} | {r["name"] for r in queued}
+    finished = [e for e in (today_info.get("jobs") or {}).values() if e["name"] not in live_ids]
+    lines = _job_lines(running, queued, finished, 5)
+    return {
+        "running": running,
+        "queued": queued,
+        "working": bool(running),
+        "today_done": today_info.get("done") or 0,
+        "today_failed": today_info.get("failed") or 0,
+        "today_total": today_info.get("total") or 0,
+        "today_missing": bool(today_info.get("missing")),
+        "last": today_info.get("last"),
+        "fallback_n": today_info.get("fallback_n") or 0,
+        "fallback_failed": any(r.get("fallback_failed") for r in running)
+            or bool((today_info.get("last") or {}).get("fallback_failed")),
+        "lines": lines,
+        "note": "Local token meters only count LOCAL jobs.",
+    }
+
+
+def spark_jobs_snapshot():
+    """Cached snapshot of running, queued, and today's finished Spark (codexq) jobs."""
+    now = time.time()
+    with _jobs_cache_lock:
+        hit = _jobs_cache.get("data")
+        if hit is not None and (now - _jobs_cache.get("t", 0)) < JOBS_CACHE_SEC:
+            return hit
+    try:
+        data = _spark_jobs_compute()
+    except Exception:
+        data = {
+            "running": [], "queued": [], "working": False, "today_done": 0,
+            "today_failed": 0, "today_total": 0, "today_missing": True,
+            "last": None, "fallback_n": 0, "fallback_failed": False,
+            "lines": [], "note": "Local token meters only count LOCAL jobs.",
+            "error": True,
+        }
+    data["panel"] = spark_jobs_panel(data)
+    data["html"] = '<div class="jobs-panel" id="spark-jobs">%s</div>' % data["panel"]
+    with _jobs_cache_lock:
+        _jobs_cache["t"] = time.time()
+        _jobs_cache["data"] = data
+    return data
+
+
+def spark_jobs_panel(data=None):
+    """Inner HTML for the hero jobs panel: counts line + up to 5 compact rows."""
+    try:
+        d = data if data is not None else spark_jobs_snapshot()
+        n_run = len(d.get("running") or [])
+        n_q = len(d.get("queued") or [])
+        if d.get("today_missing") and not (d.get("today_done") or d.get("today_failed")):
+            counts = "Today's job log is missing"
+            if n_run or n_q:
+                counts = "%d running · %d queued · %s" % (n_run, n_q, counts)
+        else:
+            counts = "%d done · %d failed · %d running · %d queued" % (
+                int(d.get("today_done") or 0),
+                int(d.get("today_failed") or 0),
+                n_run, n_q,
+            )
+        items = []
+        for row in (d.get("lines") or []):
+            st = html.escape(str(row.get("status") or "?"))
+            loc = html.escape(row.get("kind_label") or "")
+            loc_cls = (row.get("kind_label") or "").lower()
+            when = html.escape(str(row.get("when") or ""))
+            tip = html.escape(str(row.get("model") or ""), quote=True)
+            fb = ' <span class="jfail">fallback failed</span>' if row.get("fallback_failed") and row.get("status") == "failed" else ""
+            items.append(
+                '<li title="%s"><span class="jname">%s</span> '
+                '<span class="jst %s">%s</span> '
+                '<span class="jloc %s">%s</span> '
+                '<span class="jtime">%s</span>%s</li>' % (
+                    tip,
+                    html.escape(row.get("short") or row.get("name") or "?"),
+                    st, st, loc_cls, loc, when, fb,
+                )
+            )
+        lst = "<ul class=jobs-list>%s</ul>" % ("".join(items) if items else "<li class=jidle>No jobs yet today</li>")
+        return '<div class="jobs-counts">%s</div>%s' % (html.escape(counts), lst)
+    except Exception:
+        return '<div class="jobs-counts">Spark jobs unavailable</div>'
+
+
+def spark_jobs_html(data=None):
+    try:
+        d = data if data is not None else spark_jobs_snapshot()
+        if d.get("panel") is not None and data is None:
+            panel = d["panel"]
+        else:
+            panel = spark_jobs_panel(d)
+        return '<div class="jobs-panel" id="spark-jobs">%s</div>' % panel
+    except Exception:
+        return '<div class="jobs-panel" id="spark-jobs"><div class="jobs-counts">Spark jobs unavailable</div></div>'
+
+
+JOBS_CSS = """
+.jobs-tog{position:absolute;left:10px;bottom:8px;z-index:50;
+  appearance:none;cursor:pointer;border:2px solid #5a3a00;border-radius:4px;background:#0a0a0a;color:#9a7a30;
+  font:700 11px/1 ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;letter-spacing:.04em;
+  text-transform:uppercase;padding:4px 9px;text-align:center;white-space:nowrap;
+  text-decoration:none;display:inline-flex;align-items:center;justify-content:center;}
+.jobs-tog:hover{color:#c4a04a;background:#120e04;}
+.jobs-tog.on{color:#1a1000;background:var(--warn);box-shadow:inset 0 0 5px rgba(255,255,255,.12);}
+.hero{position:relative;}
+.hero-main{position:relative;width:100%;display:flex;flex-direction:column;align-items:center;min-width:0;overflow:hidden;}
+.jobs-panel{display:none;position:absolute;left:0;right:0;top:0;bottom:0;z-index:3;box-sizing:border-box;
+  padding:22px 12px 26px 12px;overflow:hidden;color:var(--muted);
+  font-size:clamp(10px,.85vw,12px);line-height:1.2;text-align:center;}
+.hero.jobs-on .jobs-panel{display:flex;flex-direction:column;justify-content:center;align-items:center;gap:1px;}
+.hero.jobs-on .hero-main > .odo-lbl,
+.hero.jobs-on .hero-main > .odo,
+.hero.jobs-on .hero-main > .range-delta{visibility:hidden;}
+.jobs-panel .jobs-counts{flex-shrink:0;text-align:center;font-weight:800;letter-spacing:.03em;color:var(--green-mid);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;}
+.jobs-panel .jobs-list{list-style:none;margin:0 auto;padding:0;overflow:hidden;min-height:0;width:max-content;max-width:100%;}
+.jobs-panel .jobs-list li{display:flex;gap:8px;align-items:baseline;justify-content:flex-start;white-space:nowrap;overflow:hidden;min-width:0;}
+.jobs-panel .jname{color:var(--green-mid);font-weight:700;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto;max-width:22em;text-align:left;}
+.jobs-panel .jst,.jobs-panel .jloc,.jobs-panel .jtime{flex:0 0 auto;font-weight:700;letter-spacing:.04em;text-transform:uppercase;}
+@media (max-width:480px){
+  .jobs-panel{padding:4px 8px 26px 8px;font-size:10px;line-height:1.2;gap:1px;}
+  .jobs-panel .jobs-list li{gap:5px;}
+}
+.jobs-panel .jst.running{color:var(--green-bright);}
+.jobs-panel .jst.queued{color:var(--warn);}
+.jobs-panel .jst.done,.jobs-panel .jst.merged{color:var(--green-mid);}
+.jobs-panel .jst.failed,.jobs-panel .jfail{color:var(--redline);}
+.jobs-panel .jloc.local{color:var(--green-bright);}
+.jobs-panel .jloc.cloud{color:#8aa;}
+.jobs-panel .jtime{color:var(--muted);font-weight:700;text-transform:none;}
+.jobs-panel .jidle{color:var(--muted);font-weight:700;}
+"""
+
+GLOW_CSS = """
+/* Lit instrument-cluster glow. Color-matched, no heavy area filters. */
+html,body{
+  background-color:#030505;
+  background-image:radial-gradient(ellipse at 50% 32%,rgba(57,255,20,.09),transparent 72%);
+}
+.cluster{
+  background-image:radial-gradient(ellipse at 50% 16%,rgba(57,255,20,.12),transparent 58%),linear-gradient(180deg,#07100a,#030505);
+  box-shadow:inset 0 0 48px rgba(57,255,20,.22),0 0 16px rgba(57,255,20,.42),0 0 32px rgba(57,255,20,.2);
+}
+h1{text-shadow:0 0 1px rgba(200,255,154,.7),0 0 6px rgba(57,255,20,.5);}
+h2,.panel.cluse > h2{text-shadow:0 0 1px rgba(240,255,232,.55),0 0 6px rgba(57,255,20,.45);}
+.lbl,.odo-lbl,.hero .odo-lbl,.hero .odo-unit,.odo-unit,.cluse-meter-hd .lbl,.cluse-stat .lbl,.io-lab,.leg-lbl,.ct{
+  text-shadow:0 0 1px rgba(240,255,232,.5),0 0 5px rgba(57,255,20,.45);}
+.muted,.tagline,.foot,.speed-unit,.cluse-plan,.cluse-detail,.cluse-note,.tach-scale,
+.jobs-panel .jtime,.jobs-panel .jidle,.jobs-panel .jname,td,th,.day-date,.day-io{
+  text-shadow:0 0 5px rgba(57,255,20,.42);}
+.mname{text-shadow:0 0 1px rgba(126,240,255,.5),0 0 6px rgba(126,240,255,.45);}
+.cluse-title,.cluse-pct,.cluse-stat-val,.jobs-panel .jobs-counts,
+.jobs-panel .jst.running,.jobs-panel .jst.done,.jobs-panel .jst.merged,.jobs-panel .jloc.local,
+.big:not(.dseg),.vfd{
+  text-shadow:0 0 1px rgba(200,255,154,.55),0 0 6px rgba(57,255,20,.48);}
+.jobs-panel .jst.queued{text-shadow:0 0 1px rgba(255,160,0,.5),0 0 5px rgba(255,160,0,.45);}
+.jobs-panel .jst.failed,.jobs-panel .jfail,.pk-short,.speed-peak{
+  text-shadow:0 0 1px rgba(255,61,26,.5),0 0 5px rgba(255,61,26,.48);}
+.jobs-panel .jloc.cloud{text-shadow:0 0 5px rgba(126,240,255,.4);}
+.cluse-card.status-awaiting .cluse-note{text-shadow:0 0 1px rgba(255,160,0,.45),0 0 5px rgba(255,160,0,.42);}
+.rtab:not(.ctog):not(.on),.dash-toggle{
+  text-shadow:0 0 5px rgba(57,255,20,.4);
+  box-shadow:0 0 6px rgba(57,255,20,.4),inset 0 0 6px rgba(57,255,20,.2);}
+.rtab.on:not(.ctog){
+  text-shadow:none;
+  box-shadow:0 0 8px rgba(57,255,20,.5),0 0 14px rgba(57,255,20,.28),inset 0 0 5px rgba(255,255,255,.18);}
+.view-tog .vtab:not(.on),.mode-tog .mtab:not(.on),.jobs-tog:not(.on),.wl.amber:not(.on){
+  text-shadow:0 0 1px rgba(255,160,0,.4),0 0 5px rgba(255,160,0,.4);
+  box-shadow:0 0 6px rgba(255,160,0,.4),inset 0 0 5px rgba(255,160,0,.16);}
+.view-tog .vtab.on,.mode-tog .mtab.on,.jobs-tog.on{
+  text-shadow:none;
+  box-shadow:0 0 8px rgba(255,160,0,.5),0 0 14px rgba(255,160,0,.25),inset 0 0 5px rgba(255,255,255,.14);}
+.wl.green.on{
+  box-shadow:0 0 8px rgba(57,255,20,.55),0 0 14px rgba(57,255,20,.3),inset 0 0 5px rgba(255,255,255,.18);}
+.wl.amber.on{
+  box-shadow:0 0 8px rgba(255,160,0,.55),0 0 14px rgba(255,160,0,.28),inset 0 0 5px rgba(255,255,255,.14);}
+.wl.red.on{
+  box-shadow:0 0 8px rgba(255,61,26,.55),0 0 14px rgba(255,61,26,.28),inset 0 0 5px rgba(255,255,255,.14);}
+.panel,.panel.cluse{
+  box-shadow:0 0 12px rgba(57,255,20,.42),0 0 22px rgba(57,255,20,.2),inset 0 0 14px rgba(57,255,20,.22);}
+.card{
+  box-shadow:0 0 10px rgba(57,255,20,.38),0 0 16px rgba(57,255,20,.16),inset 0 0 10px rgba(57,255,20,.2);}
+.card.speed{
+  box-shadow:0 0 12px rgba(57,255,20,.42),0 0 18px rgba(57,255,20,.18),inset 0 0 16px rgba(57,255,20,.22);}
+.cluse-card{
+  box-shadow:0 0 12px rgba(57,255,20,.4),0 0 18px rgba(57,255,20,.18),inset 0 0 12px rgba(57,255,20,.22);}
+.hero{
+  box-shadow:0 0 14px rgba(57,255,20,.45),0 0 24px rgba(57,255,20,.2),inset 0 0 22px rgba(57,255,20,.18);}
+.seg-on{
+  box-shadow:0 0 6px rgba(57,255,20,.55),0 0 10px rgba(57,255,20,.3),inset 0 0 3px rgba(255,255,255,.2);}
+.seg-on.warn{
+  box-shadow:0 0 6px rgba(255,160,0,.55),0 0 10px rgba(255,160,0,.3),inset 0 0 3px rgba(255,255,255,.2);}
+.seg-on.redline{
+  box-shadow:0 0 6px rgba(255,61,26,.55),0 0 10px rgba(255,61,26,.32),inset 0 0 3px rgba(255,255,255,.2);}
+.sw.lit{box-shadow:0 0 5px rgba(57,255,20,.5);}
+.day.lit{filter:drop-shadow(0 0 2.5px rgba(255,210,80,.7)) drop-shadow(0 0 5px rgba(57,255,20,.35));}
+.peak-mark{box-shadow:0 0 8px rgba(255,61,26,.9),0 0 14px rgba(255,61,26,.5);}
+"""
 
 def _kv_file(path):
     out = {}
@@ -1365,12 +2198,17 @@ def page():
     T = "DGX Token Annihilator Dashboard"
     VFD_B64 = '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'
 
+    jobs_snap = spark_jobs_snapshot()
+    jobs_panel = jobs_snap.get("panel") or ""
+    jobs_css = JOBS_CSS
+    glow_css = GLOW_CSS
+
     return f"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60><title>{T}</title><style>
 @font-face{{font-family:"VFDPixel";src:url(data:font/woff2;base64,{VFD_B64}) format("woff2");font-weight:400;font-style:normal;font-display:swap;}}@font-face{{font-family:"DSEG7";src:url("/font/dseg7.woff2") format("woff2"),url("/font/dseg7.ttf") format("truetype");font-weight:700;font-style:italic;font-display:swap;}}
 :root{{
   --bg:#030505;--panel:#0a100c;--green:#39ff14;--green-bright:#c8ff9a;--green-mid:#6dff4a;
   --line:#2a6b2a;--line-strong:#3a9a3a;--unlit:#152218;--unlit-edge:#2a3e2a;
-  --warn:#ffcc00;--redline:#ff3d1a;--muted:#a8d898;--label:#f0ffe8;--cyan:#7ef0ff;
+  --warn:#ffa000;--redline:#ff3d1a;--muted:#a8d898;--label:#f0ffe8;--cyan:#7ef0ff;
   --vfd:"VFDPixel",ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;--dseg:"DSEG7","VFDPixel",ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;
 }}
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -1387,16 +2225,21 @@ body::before{{content:"";pointer-events:none;position:fixed;inset:0;z-index:9999
   --cluster-gap:clamp(5px,.5vh,8px);
   --cluster-pad-y:clamp(8px,.7vh,12px);
   --cluster-pad-x:clamp(10px,.85vw,14px);
-  flex:1;min-height:0;width:100%;overflow:hidden;
+  flex:1;min-height:0;width:100%;overflow-x:hidden;overflow-y:auto;
   display:grid;gap:var(--cluster-gap);
-  grid-template-rows:auto auto auto minmax(0,1fr) minmax(0,.9fr) minmax(0,1fr) auto minmax(158px,1.3fr) auto;
+  grid-template-rows:auto auto auto minmax(150px,1fr) minmax(82px,.9fr) minmax(100px,1fr) auto minmax(158px,1.3fr) auto;
   border:3px solid var(--line-strong);border-radius:10px;
   padding:var(--cluster-pad-y) var(--cluster-pad-x);
   background:linear-gradient(180deg,#07100a,#030505);
   box-shadow:inset 0 0 24px #39ff1412,0 0 12px #39ff1420;
 }}
+@media (max-height:940px){{
+  html,body{{height:auto;min-height:100vh;overflow-y:auto;}}
+  body{{height:auto;}}
+  .cluster{{flex:none;overflow:visible;grid-template-rows:auto auto auto 150px 98px 120px auto 190px auto;}}
+}}
 @media (min-height:1000px){{
-  .cluster{{grid-template-rows:auto auto auto minmax(0,1fr) minmax(0,.9fr) minmax(0,1.1fr) auto minmax(158px,1.2fr) auto;}}
+  .cluster{{grid-template-rows:auto auto auto minmax(150px,1fr) minmax(82px,.9fr) minmax(100px,1.1fr) auto minmax(158px,1.2fr) auto;}}
 }}
 
 .hdr{{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;}}
@@ -1464,7 +2307,7 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 .wl.green.on{{color:#041204;background:var(--green);border-color:var(--green);
   box-shadow:0 0 6px rgba(57,255,20,.5),inset 0 0 5px rgba(255,255,255,.15);}}
 .wl.amber{{border-color:#5a3a00;color:#9a7a30;}}
-.wl.amber.on{{color:#1a1000;background:var(--warn);border-color:var(--warn);box-shadow:0 0 6px rgba(255,204,0,.5),inset 0 0 5px rgba(255,255,255,.12);}}
+.wl.amber.on{{color:#1a1000;background:var(--warn);border-color:var(--warn);box-shadow:0 0 6px rgba(255,160,0,.5),inset 0 0 5px rgba(255,255,255,.12);}}
 .wl.red{{border-color:#5a1000;color:#9a4030;}}
 .wl.red.on{{color:#1a0500;background:var(--redline);border-color:var(--redline);box-shadow:0 0 6px rgba(255,61,26,.5),inset 0 0 5px rgba(255,255,255,.12);}}
 .tagline{{color:var(--muted);font-size:clamp(11px,.9vw,13px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
@@ -1602,7 +2445,7 @@ h2::before,h2::after{{content:"";flex:1;height:2px;background:linear-gradient(90
 }}
 .tach-track i{{display:block;flex:1;min-width:2px;border-radius:1px 1px 0 0;border:1px solid transparent;}}
 .seg-on{{background:var(--green);border-color:#6dff4a;box-shadow:0 0 5px rgba(57,255,20,.45),inset 0 0 3px rgba(255,255,255,.18);}}
-.seg-on.warn{{background:var(--warn);border-color:#ffe066;box-shadow:0 0 5px rgba(255,204,0,.45),inset 0 0 3px rgba(255,255,255,.18);}}
+.seg-on.warn{{background:var(--warn);border-color:#ffc04d;box-shadow:0 0 5px rgba(255,160,0,.45),inset 0 0 3px rgba(255,255,255,.18);}}
 .seg-on.redline{{background:var(--redline);border-color:#ff8a6a;box-shadow:0 0 5px rgba(255,61,26,.5),inset 0 0 3px rgba(255,255,255,.18);}}
 .seg-off{{background:var(--unlit);border-color:var(--unlit-edge);}}
 .speed-track{{position:relative;}}.pk-short{{color:#ff8a6a;}}.speed-tach .speed-peak{{display:none;}}.peak-mark{{position:absolute;top:-4px;bottom:-4px;width:3px;margin-left:-1px;background:#ff3d1a;border-radius:1px;box-shadow:0 0 6px rgba(255,61,26,.9),0 0 12px rgba(255,61,26,.5);pointer-events:auto;}}.peak-mark::before{{content:'';position:absolute;top:-5px;left:-3px;border:4.5px solid transparent;border-top:5px solid #ff3d1a;}}.speed-peak{{font-size:10px;color:#ff8a6a;font-weight:800;letter-spacing:.06em;text-transform:uppercase;opacity:.9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
@@ -1649,10 +2492,16 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
 
 .card.hof{{justify-content:flex-start;}}
 .card.hof .lbl{{flex-shrink:0;margin-bottom:clamp(1px,.15vh,4px);}}
+.panel.body .grid > .card:not(.speed){{container-type:inline-size;}}
+.panel.body .grid > .card:not(.speed) .big.dseg{{font-size:min(clamp(20px,2.3vw,30px),10cqi);}}
+.panel.body .grid > .card:not(.speed) .lbl{{white-space:normal;overflow-wrap:anywhere;flex-shrink:0;}}
+.panel.body .grid > .card:not(.speed) .big{{flex-shrink:0;}}
 @media(max-width:900px){{
   .grid{{grid-template-columns:repeat(2,minmax(0,1fr));}}
   .card.speed{{grid-column:span 2;}}
 }}
+{jobs_css}
+{glow_css}
 </style></head><body><div class=cluster>
 <div class=hdr>
   <h1>{T}</h1>
@@ -1667,10 +2516,14 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
     <a class="vtab on" href="/" title="Desktop view">DESKTOP</a>
     <a class="vtab" href="/m" title="Mobile view">MOBILE</a>
   </div>
+  <button type="button" class="jobs-tog" id="jobs-tog" aria-pressed="false" title="Local token meters only count LOCAL jobs. Cloud and Codex jobs still count as Spark work.">JOBS</button>
   <nav class="range-tog" role="tablist" aria-label="Time range">{range_tabs}</nav>
-  <div class=odo-lbl id=hero-lbl>TOTAL TOKENS ANNIHILATED</div>
-  <div class="odo dseg seg" id=hero-odo data-val="{fmt(tot)}" data-ghost="{ghost_digits(fmt(tot))}">{fmt(tot)}</div>
-  <div class="range-delta" id="range-delta"></div>
+  <div class="hero-main">
+    <div class=odo-lbl id=hero-lbl>TOTAL TOKENS ANNIHILATED</div>
+    <div class="odo dseg seg" id=hero-odo data-val="{fmt(tot)}" data-ghost="{ghost_digits(fmt(tot))}">{fmt(tot)}</div>
+    <div class="range-delta" id="range-delta"></div>
+    <div class="jobs-panel" id="spark-jobs">{jobs_panel}</div>
+  </div>
 </div>
 
 <div class="panel body">
@@ -1772,6 +2625,15 @@ function applySpeed(s){{
 }}
 function pollSpeed(){{ fetch('/api/speed?range='+encodeURIComponent(curRange||'all'),{{cache:'no-store'}}).then(function(r){{return r.json();}}).then(applySpeed).catch(function(){{}}); }}
 setInterval(pollSpeed, 30000);
+function applyJobs(d){{ var el=$('spark-jobs'); if(!el||!d) return; if(d.panel!=null) el.innerHTML=d.panel; else if(d.html){{ var t=document.createElement('div'); t.innerHTML=d.html; var n=t.firstElementChild; if(n&&n.id==='spark-jobs') el.innerHTML=n.innerHTML; else el.innerHTML=d.html; }} }}
+function pollJobs(){{ fetch('/api/spark-jobs',{{cache:'no-store'}}).then(function(r){{return r.json();}}).then(applyJobs).catch(function(){{}}); }}
+var JOBSKEY='tad-jobs';
+var jobsOn=localStorage.getItem(JOBSKEY)==='1';
+function paintJobsView(){{ var b=$('jobs-tog'); if(b){{ b.classList.toggle('on', jobsOn); b.setAttribute('aria-pressed', jobsOn?'true':'false'); }} var hero=document.querySelector('.hero'); if(hero) hero.classList.toggle('jobs-on', jobsOn); }}
+paintJobsView();
+var jt=$('jobs-tog'); if(jt) jt.addEventListener('click', function(){{ jobsOn=!jobsOn; localStorage.setItem(JOBSKEY, jobsOn?'1':'0'); paintJobsView(); if(jobsOn) pollJobs(); }});
+pollJobs();
+setInterval(pollJobs, 15000);
 var CKEY='tad-cloud';
 var cloudOn=localStorage.getItem(CKEY)==='1';
 var curRange=active;
@@ -1919,6 +2781,10 @@ def page_mobile():
     except Exception:
         pass
 
+    jobs_snap = spark_jobs_snapshot()
+    jobs_panel = jobs_snap.get("panel") or ""
+    jobs_css = JOBS_CSS
+    glow_css = GLOW_CSS
 
     return f"""<!doctype html><html lang=en><head>
 <meta charset=utf-8>
@@ -1933,7 +2799,7 @@ def page_mobile():
 :root{{
   --bg:#030505;--panel:#0a100c;--green:#39ff14;--green-bright:#c8ff9a;--green-mid:#6dff4a;
   --line:#2a6b2a;--line-strong:#3a9a3a;--unlit:#152218;--unlit-edge:#2a3e2a;
-  --warn:#ffcc00;--redline:#ff3d1a;--muted:#a8d898;--label:#f0ffe8;--cyan:#7ef0ff;
+  --warn:#ffa000;--redline:#ff3d1a;--muted:#a8d898;--label:#f0ffe8;--cyan:#7ef0ff;
   --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
   --dseg:"DSEG7",ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;
   --safe-t:env(safe-area-inset-top,0px);--safe-b:env(safe-area-inset-bottom,0px);
@@ -2006,7 +2872,7 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.06em;text-transform:upper
 .wl.green.on{{color:#041204;background:var(--green);border-color:var(--green);
   box-shadow:0 0 6px rgba(57,255,20,.5);}}
 .wl.amber{{border-color:#5a3a00;color:#9a7a30;}}
-.wl.amber.on{{color:#1a1000;background:var(--warn);border-color:var(--warn);box-shadow:0 0 6px rgba(255,204,0,.5),inset 0 0 5px rgba(255,255,255,.12);}}
+.wl.amber.on{{color:#1a1000;background:var(--warn);border-color:var(--warn);box-shadow:0 0 6px rgba(255,160,0,.5),inset 0 0 5px rgba(255,255,255,.12);}}
 .wl.red{{border-color:#5a1000;color:#9a4030;}}
 .wl.red.on{{color:#1a0500;background:var(--redline);border-color:var(--redline);box-shadow:0 0 6px rgba(255,61,26,.5),inset 0 0 5px rgba(255,255,255,.12);}}
 .tagline{{color:var(--muted);font-size:12px;line-height:1.4;white-space:normal;}}
@@ -2072,7 +2938,7 @@ h2::before,h2::after{{content:"";flex:1;height:2px;background:linear-gradient(90
 .day-tach i{{height:100% !important;border-radius:1px;min-width:1px;}}
 .tach-track i{{display:block;flex:1;min-width:2px;border-radius:1px 1px 0 0;border:1px solid transparent;}}
 .seg-on{{background:var(--green);border-color:#6dff4a;box-shadow:0 0 5px rgba(57,255,20,.45);}}
-.seg-on.warn{{background:var(--warn);border-color:#ffe066;box-shadow:0 0 5px rgba(255,204,0,.45);}}
+.seg-on.warn{{background:var(--warn);border-color:#ffc04d;box-shadow:0 0 5px rgba(255,160,0,.45);}}
 .seg-on.redline{{background:var(--redline);border-color:#ff8a6a;box-shadow:0 0 5px rgba(255,61,26,.5);}}
 .seg-off{{background:var(--unlit);border-color:var(--unlit-edge);}}
 .speed-track{{position:relative;}}.pk-short{{color:#ff8a6a;}}.speed-tach .speed-peak{{display:none;}}.peak-mark{{position:absolute;top:-4px;bottom:-4px;width:3px;margin-left:-1px;background:#ff3d1a;border-radius:1px;box-shadow:0 0 6px rgba(255,61,26,.9),0 0 12px rgba(255,61,26,.5);pointer-events:auto;}}.peak-mark::before{{content:'';position:absolute;top:-5px;left:-3px;border:4.5px solid transparent;border-top:5px solid #ff3d1a;}}.speed-peak{{font-size:10px;color:#ff8a6a;font-weight:800;letter-spacing:.06em;text-transform:uppercase;opacity:.9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
@@ -2118,6 +2984,29 @@ h2::before,h2::after{{content:"";flex:1;height:2px;background:linear-gradient(90
 .io-lab{{color:var(--label);font-size:11px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;margin-right:2px;}}
 .foot{{text-align:center;color:var(--muted);font-size:12px;letter-spacing:.03em;padding-top:4px;}}
 .seg{{font-variant-numeric:tabular-nums;}}
+/* Mobile declutter: more air, one-column cards, wrap instead of clip. */
+.tagline,.bill-meta .muted{{display:none;}}
+body{{padding:calc(16px + var(--safe-t)) calc(14px + var(--safe-r)) calc(22px + var(--safe-b)) calc(14px + var(--safe-l));}}
+.cluster{{--cluster-gap:20px;--cluster-pad-y:18px;--cluster-pad-x:14px;}}
+.hdr{{gap:12px;}}
+.wl-row{{gap:8px;}}
+.range-tog{{margin-top:6px;gap:4px;}}
+.hero{{padding:18px 12px 16px;gap:10px;}}
+.panel{{gap:14px;padding:16px 14px;}}
+.grid{{grid-template-columns:1fr;gap:12px;}}
+.card{{padding:14px 12px;gap:6px;}}
+.bill-grid,.hof-grid{{gap:12px;}}
+.day-log{{gap:12px;}}
+.day-item{{padding-bottom:12px;}}
+.speed-stack{{gap:10px;}}
+.grid .card:not(.speed) .big.dseg{{
+  font-size:clamp(20px,8.2vw,30px);letter-spacing:.04em;overflow:visible;
+}}
+.speed-peak{{white-space:normal;overflow:visible;text-overflow:clip;line-height:1.35;overflow-wrap:anywhere;}}
+.speed-readout{{flex-wrap:wrap;justify-content:center;}}
+.lbl{{overflow-wrap:anywhere;white-space:normal;}}
+{jobs_css}
+{glow_css}
 </style></head><body><div class=cluster>
 <div class=hdr>
   <div class=hdr-top>
@@ -2129,16 +3018,20 @@ h2::before,h2::after{{content:"";flex:1;height:2px;background:linear-gradient(90
 <div class=tagline>Every token on port {PROXY_PORT} is one the cloud will never bill. Last report: {datetime.now():%b %d %H:%M}.</div>
 
 <div class=hero>
-  <div class=odo-lbl id=hero-lbl>TOTAL TOKENS ANNIHILATED</div>
-  <div class="odo dseg seg" id=hero-odo data-val="{fmt(tot)}" data-ghost="{ghost_digits(fmt(tot))}">{fmt(tot)}</div>
-  <div class="range-delta" id="range-delta"></div>
+  <button type="button" class="jobs-tog" id="jobs-tog" aria-pressed="false" title="Local token meters only count LOCAL jobs. Cloud and Codex jobs still count as Spark work.">JOBS</button>
+  <div class="hero-main">
+    <div class=odo-lbl id=hero-lbl>TOTAL TOKENS ANNIHILATED</div>
+    <div class="odo dseg seg" id=hero-odo data-val="{fmt(tot)}" data-ghost="{ghost_digits(fmt(tot))}">{fmt(tot)}</div>
+    <div class="range-delta" id="range-delta"></div>
+    <div class="jobs-panel" id="spark-jobs">{jobs_panel}</div>
+  </div>
 </div>
 
 <div class="panel body">
   <h2>Body count</h2>
   <div class=grid>
     <div class="card speed">
-      <div class=lbl id=speed-lbl>Annihilation speed (avg · ALL)</div>
+      <div class=lbl id=speed-lbl>Speed (avg · ALL)</div>
       <div class=speed-stack>
         <div class='tach-track speed-track' id=speed-tach>{tach}{peak_mark}</div>
         <div class=tach-scale id=speed-scale>{tach_scale}</div>
@@ -2253,12 +3146,21 @@ function applySpeed(s){{
   setDseg($('speed-val'), s.live_disp);
   var pm=$('peak-mark'); if(pm){{ pm.style.left=(100*Math.min(1,s.peak/s.scale))+'%'; pm.title=s.peak_label; }}
   var pl=$('speed-peak'); if(pl) pl.textContent=s.peak_label;
-  var lb=$('speed-lbl'); if(lb&&s.range_label) lb.textContent='Annihilation speed (avg · '+s.range_label+')';
+  var lb=$('speed-lbl'); if(lb&&s.range_label) lb.textContent='Speed (avg · '+s.range_label+')';
   var pk=$('speed-pk'); if(pk){{ pk.textContent='peak '+s.peak.toFixed(1); pk.title=s.peak_label; }}
   var sc=$('speed-scale'); if(sc&&s.ticks) sc.innerHTML=s.ticks.map(function(v){{return '<span>'+v+'</span>';}}).join('');
 }}
 function pollSpeed(){{ fetch('/api/speed?range='+encodeURIComponent(curRange||'all'),{{cache:'no-store'}}).then(function(r){{return r.json();}}).then(applySpeed).catch(function(){{}}); }}
 setInterval(pollSpeed, 30000);
+function applyJobs(d){{ var el=$('spark-jobs'); if(!el||!d) return; if(d.panel!=null) el.innerHTML=d.panel; else if(d.html){{ var t=document.createElement('div'); t.innerHTML=d.html; var n=t.firstElementChild; if(n&&n.id==='spark-jobs') el.innerHTML=n.innerHTML; else el.innerHTML=d.html; }} }}
+function pollJobs(){{ fetch('/api/spark-jobs',{{cache:'no-store'}}).then(function(r){{return r.json();}}).then(applyJobs).catch(function(){{}}); }}
+var JOBSKEY='tad-jobs';
+var jobsOn=localStorage.getItem(JOBSKEY)==='1';
+function paintJobsView(){{ var b=$('jobs-tog'); if(b){{ b.classList.toggle('on', jobsOn); b.setAttribute('aria-pressed', jobsOn?'true':'false'); }} var hero=document.querySelector('.hero'); if(hero) hero.classList.toggle('jobs-on', jobsOn); }}
+paintJobsView();
+var jt=$('jobs-tog'); if(jt) jt.addEventListener('click', function(){{ jobsOn=!jobsOn; localStorage.setItem(JOBSKEY, jobsOn?'1':'0'); paintJobsView(); if(jobsOn) pollJobs(); }});
+pollJobs();
+setInterval(pollJobs, 15000);
 var CKEY='tad-cloud';
 var cloudOn=localStorage.getItem(CKEY)==='1';
 var curRange=active;
@@ -2368,6 +3270,7 @@ def page_cloud(mobile=False, range_key="all"):
 .hero .range-tog .rtab{appearance:none;cursor:pointer;border:1px solid #1a2e1a;background:#0a120c;color:#5a7a5a;font:700 10px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;padding:2px 6px;border-radius:2px;text-decoration:none;display:inline-flex;justify-content:center;white-space:nowrap;}
 .hero .range-tog .rtab.on{color:#041204;background:var(--green);border-color:var(--green-bright);}"""
 
+    glow_css = GLOW_CSS
     return f"""<!doctype html><html lang=en><head>
 <meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -2379,7 +3282,7 @@ def page_cloud(mobile=False, range_key="all"):
 :root{{
   --bg:#030505;--panel:#0a100c;--green:#39ff14;--green-bright:#c8ff9a;--green-mid:#6dff4a;
   --line:#2a6b2a;--line-strong:#3a9a3a;--unlit:#152218;--unlit-edge:#2a3e2a;
-  --warn:#ffcc00;--redline:#ff3d1a;--muted:#a8d898;--label:#f0ffe8;--cyan:#7ef0ff;
+  --warn:#ffa000;--redline:#ff3d1a;--muted:#a8d898;--label:#f0ffe8;--cyan:#7ef0ff;
   --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
   --dseg:"DSEG7",ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;
   --safe-t:env(safe-area-inset-top,0px);--safe-b:env(safe-area-inset-bottom,0px);
@@ -2477,7 +3380,7 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 .tach-track{{display:flex;align-items:flex-end;gap:2px;height:22px;border-bottom:2px solid var(--line-strong);width:100%;}}
 .tach-track i{{display:block;flex:1;min-width:2px;border-radius:1px 1px 0 0;border:1px solid transparent;}}
 .seg-on{{background:var(--green);border-color:#6dff4a;box-shadow:0 0 5px rgba(57,255,20,.45);}}
-.seg-on.warn{{background:var(--warn);border-color:#ffe066;box-shadow:0 0 5px rgba(255,204,0,.45);}}
+.seg-on.warn{{background:var(--warn);border-color:#ffc04d;box-shadow:0 0 5px rgba(255,160,0,.45);}}
 .seg-on.redline{{background:var(--redline);border-color:#ff8a6a;box-shadow:0 0 5px rgba(255,61,26,.5);}}
 .seg-off{{background:var(--unlit);border-color:var(--unlit-edge);}}
 .cluse-tach{{height:18px;gap:1px;}}
@@ -2505,6 +3408,7 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 .muted{{color:var(--muted);}}
 .foot{{text-align:center;color:var(--muted);font-size:12px;letter-spacing:.03em;padding:0;margin:0;}}.foot-bar{{position:relative;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:calc(-1 * var(--cluster-gap));margin-bottom:calc(-1 * var(--cluster-pad-y));min-height:calc(32px + var(--cluster-gap) + var(--cluster-pad-y));padding:0 2px;box-sizing:border-box;z-index:5;}}.foot-bar .foot{{flex:1;min-width:0;padding:0 110px 0 0;box-sizing:border-box;}}
 {tog_css}
+{glow_css}
 </style></head><body><div class=cluster>
 <div class=hdr>
   <h1>{T}</h1>
@@ -2841,7 +3745,7 @@ def page_office():
 <title>Office · Token Annihilator</title>
 <style>
 :root{--bg:#030505;--panel:#0a100c;--green:#39ff14;--green-bright:#c8ff9a;--muted:#a8d898;--label:#f0ffe8;
---warn:#ffcc00;--redline:#ff3d1a;--cyan:#7ef0ff;--line:#1a3a22;--line-strong:#2a5a32;--waiting:#ff9f1a}
+--warn:#ffa000;--redline:#ff3d1a;--cyan:#7ef0ff;--line:#1a3a22;--line-strong:#2a5a32;--waiting:#ff9f1a}
 *{box-sizing:border-box}
 html,body{margin:0;min-height:100%;background:var(--bg);color:var(--green);
 font:14px/1.4 ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace}
@@ -3047,6 +3951,17 @@ class Dash(http.server.BaseHTTPRequestHandler):
             try:
                 payload = json.dumps(stats_payload(rng, cloud=cl)).encode()
                 code = 200
+            except Exception as e:
+                payload = json.dumps({"error": str(e)}).encode(); code = 500
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers(); self.wfile.write(payload); return
+
+        if path == "/api/spark-jobs":
+            try:
+                payload = json.dumps(spark_jobs_snapshot()).encode(); code = 200
             except Exception as e:
                 payload = json.dumps({"error": str(e)}).encode(); code = 500
             self.send_response(code)
