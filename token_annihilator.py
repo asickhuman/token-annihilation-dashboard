@@ -886,69 +886,75 @@ JOBS_CSS = """
 """
 
 GLOW_CSS = """
-/* Lit instrument-cluster glow. Color-matched, no heavy area filters. */
-html,body{
-  background-color:#030505;
-  background-image:radial-gradient(ellipse at 50% 32%,rgba(57,255,20,.09),transparent 72%);
-}
+/* Even instrument-cluster glow, ~20% stronger than the even pass. Color-matched; no radial fills. */
 .cluster{
-  background-image:radial-gradient(ellipse at 50% 16%,rgba(57,255,20,.12),transparent 58%),linear-gradient(180deg,#07100a,#030505);
-  box-shadow:inset 0 0 48px rgba(57,255,20,.22),0 0 16px rgba(57,255,20,.42),0 0 32px rgba(57,255,20,.2);
+  box-shadow:0 0 10px rgba(57,255,20,.37),0 0 22px rgba(57,255,20,.15),inset 0 0 12px rgba(57,255,20,.20);
 }
-h1{text-shadow:0 0 1px rgba(200,255,154,.7),0 0 6px rgba(57,255,20,.5);}
-h2,.panel.cluse > h2{text-shadow:0 0 1px rgba(240,255,232,.55),0 0 6px rgba(57,255,20,.45);}
-.lbl,.odo-lbl,.hero .odo-lbl,.hero .odo-unit,.odo-unit,.cluse-meter-hd .lbl,.cluse-stat .lbl,.io-lab,.leg-lbl,.ct{
-  text-shadow:0 0 1px rgba(240,255,232,.5),0 0 5px rgba(57,255,20,.45);}
+.panel,.panel.cluse,.card,.card.speed,.card.hof,.card.bill,.cluse-card,.hero{
+  box-shadow:0 0 7px rgba(57,255,20,.32),0 0 15px rgba(57,255,20,.12),inset 0 0 10px rgba(57,255,20,.15);
+}
+.range-tog,.hof-sel,.desk-link,#tip{
+  box-shadow:0 0 6px rgba(57,255,20,.27),inset 0 0 6px rgba(57,255,20,.12);
+}
+/* Amber bezels (LOCAL/CLOUD, DESKTOP/MOBILE): glow on the group so overflow:hidden cannot clip it. */
+.view-tog,.mode-tog{
+  box-shadow:0 0 7px rgba(255,160,0,.37),0 0 15px rgba(255,160,0,.15),inset 0 0 7px rgba(255,160,0,.15);
+}
+h1{text-shadow:0 0 1px rgba(200,255,154,.67),0 0 6px rgba(57,255,20,.34);}
+h2,.panel.cluse > h2{text-shadow:0 0 1px rgba(240,255,232,.49),0 0 6px rgba(57,255,20,.29);}
+.lbl,.odo-lbl,.hero .odo-lbl,.hero .odo-unit,.odo-unit,.cluse-meter-hd .lbl,.cluse-stat .lbl,.io-lab,.leg-lbl,.ct,
+.range-delta.show,.range-delta.show.up{
+  text-shadow:0 0 1px rgba(240,255,232,.43),0 0 5px rgba(57,255,20,.27);}
 .muted,.tagline,.foot,.speed-unit,.cluse-plan,.cluse-detail,.cluse-note,.tach-scale,
 .jobs-panel .jtime,.jobs-panel .jidle,.jobs-panel .jname,td,th,.day-date,.day-io{
-  text-shadow:0 0 5px rgba(57,255,20,.42);}
-.mname{text-shadow:0 0 1px rgba(126,240,255,.5),0 0 6px rgba(126,240,255,.45);}
+  text-shadow:0 0 4px rgba(57,255,20,.22);}
+.mname{text-shadow:0 0 1px rgba(126,240,255,.49),0 0 6px rgba(126,240,255,.32);}
 .cluse-title,.cluse-pct,.cluse-stat-val,.jobs-panel .jobs-counts,
 .jobs-panel .jst.running,.jobs-panel .jst.done,.jobs-panel .jst.merged,.jobs-panel .jloc.local,
 .big:not(.dseg),.vfd{
-  text-shadow:0 0 1px rgba(200,255,154,.55),0 0 6px rgba(57,255,20,.48);}
-.jobs-panel .jst.queued{text-shadow:0 0 1px rgba(255,160,0,.5),0 0 5px rgba(255,160,0,.45);}
-.jobs-panel .jst.failed,.jobs-panel .jfail,.pk-short,.speed-peak{
-  text-shadow:0 0 1px rgba(255,61,26,.5),0 0 5px rgba(255,61,26,.48);}
-.jobs-panel .jloc.cloud{text-shadow:0 0 5px rgba(126,240,255,.4);}
-.cluse-card.status-awaiting .cluse-note{text-shadow:0 0 1px rgba(255,160,0,.45),0 0 5px rgba(255,160,0,.42);}
+  text-shadow:0 0 1px rgba(200,255,154,.49),0 0 6px rgba(57,255,20,.32);}
+.jobs-panel .jst.queued{text-shadow:0 0 1px rgba(255,160,0,.49),0 0 5px rgba(255,160,0,.32);}
+.jobs-panel .jst.failed,.jobs-panel .jfail,.pk-short,.speed-peak,.range-delta.show.down{
+  text-shadow:0 0 1px rgba(255,61,26,.49),0 0 5px rgba(255,61,26,.32);}
+.jobs-panel .jloc.cloud{text-shadow:0 0 4px rgba(136,170,170,.34);}
+.cluse-card.status-awaiting .cluse-note{text-shadow:0 0 1px rgba(255,160,0,.43),0 0 5px rgba(255,160,0,.29);}
 .rtab:not(.ctog):not(.on),.dash-toggle{
-  text-shadow:0 0 5px rgba(57,255,20,.4);
-  box-shadow:0 0 6px rgba(57,255,20,.4),inset 0 0 6px rgba(57,255,20,.2);}
+  text-shadow:0 0 4px rgba(57,255,20,.27);
+  box-shadow:0 0 6px rgba(57,255,20,.32),inset 0 0 5px rgba(57,255,20,.12);}
 .rtab.on:not(.ctog){
   text-shadow:none;
-  box-shadow:0 0 8px rgba(57,255,20,.5),0 0 14px rgba(57,255,20,.28),inset 0 0 5px rgba(255,255,255,.18);}
-.view-tog .vtab:not(.on),.mode-tog .mtab:not(.on),.jobs-tog:not(.on),.wl.amber:not(.on){
-  text-shadow:0 0 1px rgba(255,160,0,.4),0 0 5px rgba(255,160,0,.4);
-  box-shadow:0 0 6px rgba(255,160,0,.4),inset 0 0 5px rgba(255,160,0,.16);}
-.view-tog .vtab.on,.mode-tog .mtab.on,.jobs-tog.on{
+  box-shadow:0 0 7px rgba(57,255,20,.44),0 0 15px rgba(57,255,20,.17),inset 0 0 5px rgba(255,255,255,.20);}
+/* Inner amber tabs: inset + text only. Outer halo lives on the bezel. */
+.view-tog .vtab:not(.on),.mode-tog .mtab:not(.on){
+  text-shadow:0 0 1px rgba(255,160,0,.43),0 0 5px rgba(255,160,0,.27);
+  box-shadow:inset 0 0 6px rgba(255,160,0,.15);}
+.view-tog .vtab.on,.mode-tog .mtab.on{
   text-shadow:none;
-  box-shadow:0 0 8px rgba(255,160,0,.5),0 0 14px rgba(255,160,0,.25),inset 0 0 5px rgba(255,255,255,.14);}
+  box-shadow:inset 0 0 6px rgba(255,255,255,.17);}
+.jobs-tog:not(.on),.wl.amber:not(.on){
+  text-shadow:0 0 1px rgba(255,160,0,.43),0 0 5px rgba(255,160,0,.27);
+  box-shadow:0 0 6px rgba(255,160,0,.34),0 0 12px rgba(255,160,0,.15),inset 0 0 6px rgba(255,160,0,.15);}
+.jobs-tog.on,.wl.amber.on{
+  text-shadow:none;
+  box-shadow:0 0 7px rgba(255,160,0,.44),0 0 15px rgba(255,160,0,.17),inset 0 0 6px rgba(255,255,255,.17);}
 .wl.green.on{
-  box-shadow:0 0 8px rgba(57,255,20,.55),0 0 14px rgba(57,255,20,.3),inset 0 0 5px rgba(255,255,255,.18);}
-.wl.amber.on{
-  box-shadow:0 0 8px rgba(255,160,0,.55),0 0 14px rgba(255,160,0,.28),inset 0 0 5px rgba(255,255,255,.14);}
-.wl.red.on{
-  box-shadow:0 0 8px rgba(255,61,26,.55),0 0 14px rgba(255,61,26,.28),inset 0 0 5px rgba(255,255,255,.14);}
-.panel,.panel.cluse{
-  box-shadow:0 0 12px rgba(57,255,20,.42),0 0 22px rgba(57,255,20,.2),inset 0 0 14px rgba(57,255,20,.22);}
-.card{
-  box-shadow:0 0 10px rgba(57,255,20,.38),0 0 16px rgba(57,255,20,.16),inset 0 0 10px rgba(57,255,20,.2);}
-.card.speed{
-  box-shadow:0 0 12px rgba(57,255,20,.42),0 0 18px rgba(57,255,20,.18),inset 0 0 16px rgba(57,255,20,.22);}
-.cluse-card{
-  box-shadow:0 0 12px rgba(57,255,20,.4),0 0 18px rgba(57,255,20,.18),inset 0 0 12px rgba(57,255,20,.22);}
-.hero{
-  box-shadow:0 0 14px rgba(57,255,20,.45),0 0 24px rgba(57,255,20,.2),inset 0 0 22px rgba(57,255,20,.18);}
+  text-shadow:none;
+  box-shadow:0 0 7px rgba(57,255,20,.44),0 0 15px rgba(57,255,20,.17),inset 0 0 6px rgba(255,255,255,.20);}
+.wl.red:not(.on),.rtab.ctog:not(.on){
+  text-shadow:0 0 4px rgba(255,61,26,.27);
+  box-shadow:0 0 6px rgba(255,61,26,.32),inset 0 0 5px rgba(255,61,26,.12);}
+.wl.red.on,.rtab.ctog.on{
+  text-shadow:0 0 4px rgba(255,220,210,.43);
+  box-shadow:0 0 7px rgba(255,61,26,.49),0 0 15px rgba(255,61,26,.20),inset 0 0 5px rgba(255,255,255,.20);}
 .seg-on{
-  box-shadow:0 0 6px rgba(57,255,20,.55),0 0 10px rgba(57,255,20,.3),inset 0 0 3px rgba(255,255,255,.2);}
+  box-shadow:0 0 6px rgba(57,255,20,.44),inset 0 0 4px rgba(255,255,255,.20);}
 .seg-on.warn{
-  box-shadow:0 0 6px rgba(255,160,0,.55),0 0 10px rgba(255,160,0,.3),inset 0 0 3px rgba(255,255,255,.2);}
+  box-shadow:0 0 6px rgba(255,160,0,.44),inset 0 0 4px rgba(255,255,255,.20);}
 .seg-on.redline{
-  box-shadow:0 0 6px rgba(255,61,26,.55),0 0 10px rgba(255,61,26,.32),inset 0 0 3px rgba(255,255,255,.2);}
-.sw.lit{box-shadow:0 0 5px rgba(57,255,20,.5);}
-.day.lit{filter:drop-shadow(0 0 2.5px rgba(255,210,80,.7)) drop-shadow(0 0 5px rgba(57,255,20,.35));}
-.peak-mark{box-shadow:0 0 8px rgba(255,61,26,.9),0 0 14px rgba(255,61,26,.5);}
+  box-shadow:0 0 6px rgba(255,61,26,.46),inset 0 0 4px rgba(255,255,255,.20);}
+.sw.lit{box-shadow:0 0 6px rgba(57,255,20,.43);}
+.day.lit{filter:drop-shadow(0 0 2px rgba(255,200,80,.49));}
+.peak-mark{box-shadow:0 0 6px rgba(255,61,26,.67),0 0 12px rgba(255,61,26,.34);}
 """
 
 def _kv_file(path):
@@ -1135,11 +1141,13 @@ CLOUD_SNAP_JSONL = os.path.join(CLOUD_DIR, "cloud_snapshots.jsonl")
 BOT_AVATARS = {
     "Veil PM": ("#FF6700", "pumpkin"),
     "dr eggbot": ("#F4F2EE", "teardrop"),
+    "dr eggbot v2": ("#E31B23", "teardrop"),
     "Zonk Bot": ("#9159FE", "cloud"),
     "Veil Assets": ("#FF309B", "flower"),
     "Veil Triage": ("#FF263C", "wedge"),
     "Model Evals": ("#1084FE", "sparkle"),
     "Token CEO": ("#00C972", "hex"),
+    "Job Hunt": ("#2F6BFF", "square"),
 }
 
 def _bot_avatar_svg(name, size=28):
@@ -1164,6 +1172,7 @@ def _bot_avatar_svg(name, size=28):
         "wedge": '<path d="M16 5 L27 25 L5 25 Z" fill="%s"%s/>' % (c, stroke_attr),
         "sparkle": '<path d="M16 3 L19 13 L29 16 L19 19 L16 29 L13 19 L3 16 L13 13 Z" fill="%s"%s/>' % (c, stroke_attr),
         "hex": '<path d="M16 4 L27 10.5 L27 21.5 L16 28 L5 21.5 L5 10.5 Z" fill="%s"%s/>' % (c, stroke_attr),
+        "square": '<rect x="6" y="6" width="20" height="20" rx="2.5" fill="%s"%s/>' % (c, stroke_attr),
     }
     body = paths.get(shape, paths["hex"])
     return '<svg class="bot-av" width="%d" height="%d" viewBox="0 0 32 32" aria-hidden="true">%s</svg>' % (size, size, body)
@@ -1731,6 +1740,10 @@ def _range_dates(key):
         return (today - timedelta(days=29)).isoformat(), today.isoformat(), None, None, key
     return today.replace(month=1, day=1).isoformat(), today.isoformat(), None, None, key
 
+# Prefer eval_s (generation time). Fall back to wall-clock duration_s when eval_s is
+# missing: TensorFold / OpenAI-style /v1 responses do not include Ollama eval_duration.
+SPEED_SEC = "COALESCE(NULLIF(eval_s,0), NULLIF(duration_s,0))"
+
 def _sum_range(c, start, end):
     P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')"
     if start is None:
@@ -1738,7 +1751,7 @@ def _sum_range(c, start, end):
             f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}"
         ).fetchone()
         tps = c.execute(
-            f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0"
+            f"SELECT SUM(output_tokens)/SUM({SPEED_SEC}) FROM requests WHERE {P} AND {SPEED_SEC}>0 AND output_tokens>0"
         ).fetchone()[0]
     else:
         tin, tout, nreq = c.execute(
@@ -1746,7 +1759,7 @@ def _sum_range(c, start, end):
             (start, end),
         ).fetchone()
         tps = c.execute(
-            f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0 AND date(ts,'unixepoch','localtime') BETWEEN ? AND ?",
+            f"SELECT SUM(output_tokens)/SUM({SPEED_SEC}) FROM requests WHERE {P} AND {SPEED_SEC}>0 AND output_tokens>0 AND date(ts,'unixepoch','localtime') BETWEEN ? AND ?",
             (start, end),
         ).fetchone()[0]
     return int(tin or 0), int(tout or 0), int(nreq or 0), tps
@@ -1759,7 +1772,7 @@ def _sum_range_ts(c, start_ts, end_ts):
         (float(start_ts), float(end_ts)),
     ).fetchone()
     tps = c.execute(
-        f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0 AND ts>=? AND ts<?",
+        f"SELECT SUM(output_tokens)/SUM({SPEED_SEC}) FROM requests WHERE {P} AND {SPEED_SEC}>0 AND output_tokens>0 AND ts>=? AND ts<?",
         (float(start_ts), float(end_ts)),
     ).fetchone()[0]
     return int(tin or 0), int(tout or 0), int(nreq or 0), tps
@@ -1966,7 +1979,7 @@ def stats_payload(range_key="all", cloud=False):
 
 SPEED_LIVE_WIN = 600  # seconds: semi-live tach window
 def speed_payload(range_key="all"):
-    """Tach: average output tok/s (SUM out / SUM eval_s) over the selected period, plus all-time single-request peak."""
+    """Tach: average output tok/s over the selected period, plus that period's single-request peak."""
     rk, lo_ms, hi_ms = _opencode_range_bounds_ms(range_key)
     P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')"
     c = db()
@@ -1974,8 +1987,14 @@ def speed_payload(range_key="all"):
         now = time.time()
         lo = (lo_ms / 1000.0) if lo_ms is not None else 0.0
         hi = (hi_ms / 1000.0) if hi_ms is not None else now + 1
-        r = c.execute(f"SELECT SUM(output_tokens), SUM(eval_s), COUNT(*) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0 AND ts>=? AND ts<?", (lo, hi)).fetchone()
-        pk = c.execute(f"SELECT CAST(output_tokens AS REAL)/eval_s AS t, ts, CASE WHEN model='Qwen3.8-Flash-Next' OR lower(model)='qwen3.8-flash-next-fp4' THEN 'Qwen3.8 Flash FP4 (TensorFold)' WHEN lower(model)='qwen3.8-flash-next-iq3_s' THEN 'Qwen3.8 Flash IQ3_S (Strata)' ELSE COALESCE(model,'?') END FROM requests WHERE {P} AND eval_s>=2 AND output_tokens>=64 ORDER BY t DESC LIMIT 1").fetchone()
+        r = c.execute(
+            f"SELECT SUM(output_tokens), SUM({SPEED_SEC}), COUNT(*) FROM requests WHERE {P} AND {SPEED_SEC}>0 AND output_tokens>0 AND ts>=? AND ts<?",
+            (lo, hi),
+        ).fetchone()
+        pk = c.execute(
+            f"SELECT CAST(output_tokens AS REAL)/({SPEED_SEC}) AS t, ts, CASE WHEN model='Qwen3.8-Flash-Next' OR lower(model)='qwen3.8-flash-next-fp4' THEN 'Qwen3.8 Flash FP4 (TensorFold)' WHEN lower(model)='qwen3.8-flash-next-iq3_s' THEN 'Qwen3.8 Flash IQ3_S (Strata)' ELSE COALESCE(model,'?') END FROM requests WHERE {P} AND {SPEED_SEC}>=2 AND output_tokens>=64 AND ts>=? AND ts<? ORDER BY t DESC LIMIT 1",
+            (lo, hi),
+        ).fetchone()
     finally:
         c.close()
     live = (float(r[0]) / float(r[1])) if (r and r[1]) else 0.0
@@ -2083,7 +2102,7 @@ def page():
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
     P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')"
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
-    tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
+    tps = q(f"SELECT SUM(output_tokens)/SUM({SPEED_SEC}) FROM requests WHERE {P} AND {SPEED_SEC}>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
     models = q(f"SELECT CASE WHEN model='Qwen3.8-Flash-Next' OR lower(model)='qwen3.8-flash-next-fp4' THEN 'Qwen3.8 Flash FP4 (TensorFold)' WHEN lower(model)='qwen3.8-flash-next-iq3_s' THEN 'Qwen3.8 Flash IQ3_S (Strata)' ELSE COALESCE(model,'?') END, SUM(COALESCE(request_count,1)), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 40")
     cal = calendar(c); c.close()
@@ -2288,10 +2307,11 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.08em;text-transform:upper
 .view-tog .vtab.on,.mode-tog .mtab.on{{color:#1a1000;background:var(--warn);box-shadow:inset 0 0 5px rgba(255,255,255,.12);}}
 
 .hero .odo-lbl,.hero .odo{{white-space:nowrap;}}
-.range-delta{{display:none;}}
-.range-delta.show{{display:block;text-align:center;font-size:11px;font-weight:800;letter-spacing:.03em;
-  color:var(--green-mid);line-height:1.2;margin:0;padding:0;max-height:1.2em;overflow:hidden;
+.range-delta{{display:block;visibility:hidden;height:1.2em;min-height:1.2em;line-height:1.2em;
+  text-align:center;font-size:11px;font-weight:800;letter-spacing:.03em;
+  color:var(--green-mid);margin:0;padding:0;overflow:hidden;
   white-space:nowrap;text-overflow:ellipsis;width:100%;}}
+.range-delta.show{{visibility:visible;}}
 .range-delta.show.up{{color:var(--green-bright);}}
 .range-delta.show.down{{color:var(--redline);}}
 .hof-pick-bar{{display:flex;align-items:center;justify-content:space-between;gap:4px;margin:0;flex-shrink:0;min-height:0;}}
@@ -2683,7 +2703,7 @@ def page_mobile():
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
     P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')"
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
-    tps = q(f"SELECT SUM(output_tokens)/SUM(eval_s) FROM requests WHERE {P} AND eval_s>0 AND output_tokens>0")[0][0]
+    tps = q(f"SELECT SUM(output_tokens)/SUM({SPEED_SEC}) FROM requests WHERE {P} AND {SPEED_SEC}>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
     models = q(f"SELECT CASE WHEN model='Qwen3.8-Flash-Next' OR lower(model)='qwen3.8-flash-next-fp4' THEN 'Qwen3.8 Flash FP4 (TensorFold)' WHEN lower(model)='qwen3.8-flash-next-iq3_s' THEN 'Qwen3.8 Flash IQ3_S (Strata)' ELSE COALESCE(model,'?') END, SUM(COALESCE(request_count,1)), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) t FROM requests WHERE {P} GROUP BY 1 ORDER BY t DESC LIMIT 3")
     cal = calendar(c); c.close()
@@ -2863,8 +2883,11 @@ h1{{margin:0;color:var(--green-bright);letter-spacing:.06em;text-transform:upper
   box-shadow:0 0 6px rgba(255,30,30,.9),0 0 14px rgba(255,30,30,.55),inset 0 0 4px rgba(255,255,255,.35);}}
 .rtab.rtab-link{{color:var(--muted);flex:0 0 auto;}}
 .hero .odo{{white-space:nowrap;}}
-.range-delta{{display:none;}}
-.range-delta.show{{display:block;text-align:center;font-size:11px;font-weight:800;color:var(--green-mid);}}
+.range-delta{{display:block;visibility:hidden;height:1.2em;min-height:1.2em;line-height:1.2em;
+  text-align:center;font-size:11px;font-weight:800;letter-spacing:.03em;
+  color:var(--green-mid);margin:0;padding:0;overflow:hidden;
+  white-space:nowrap;text-overflow:ellipsis;width:100%;}}
+.range-delta.show{{visibility:visible;}}
 .range-delta.show.up{{color:var(--green-bright);}}
 .range-delta.show.down{{color:var(--redline);}}
 .wl{{font-size:11px;letter-spacing:.06em;padding:3px 7px;border:2px solid #333;color:#777;
