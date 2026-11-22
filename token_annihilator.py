@@ -1795,8 +1795,21 @@ def _range_dates(key):
 # missing: TensorFold / OpenAI-style /v1 responses do not include Ollama eval_duration.
 SPEED_SEC = "COALESCE(NULLIF(eval_s,0), NULLIF(duration_s,0))"
 
+# Local inference receipts in stats.db (hero, ranges, tach, per-model). Keep this list
+# in sync with local_usage_sync.LOCAL_SOURCE_TAGS. source='backfill' stays excluded.
+LOCAL_SOURCES = (
+    "proxy",
+    "hermes-direct",
+    "eval-direct",
+    "strata-direct",
+    "opencode-local",
+    "tensorfold-direct",
+    "metrics-direct",
+)
+LOCAL_SOURCE_SQL = "source IN (%s)" % ",".join("'%s'" % s for s in LOCAL_SOURCES)
+
 def _sum_range(c, start, end):
-    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')"
+    P = LOCAL_SOURCE_SQL
     if start is None:
         tin, tout, nreq = c.execute(
             f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}"
@@ -1817,7 +1830,7 @@ def _sum_range(c, start, end):
 
 def _sum_range_ts(c, start_ts, end_ts):
     """Sum proxy/hermes tokens in a half-open unix-timestamp window [start_ts, end_ts)."""
-    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')"
+    P = LOCAL_SOURCE_SQL
     tin, tout, nreq = c.execute(
         f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P} AND ts>=? AND ts<?",
         (float(start_ts), float(end_ts)),
@@ -2032,7 +2045,7 @@ SPEED_LIVE_WIN = 600  # seconds: semi-live tach window
 def speed_payload(range_key="all"):
     """Tach: average output tok/s over the selected period, plus that period's single-request peak."""
     rk, lo_ms, hi_ms = _opencode_range_bounds_ms(range_key)
-    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')"
+    P = LOCAL_SOURCE_SQL
     c = db()
     try:
         now = time.time()
@@ -2090,7 +2103,7 @@ def hof_card_html(rank_lbl, name, tokens, nreq, pct):
 
 def calendar(c):
     from datetime import date, timedelta
-    rows = c.execute("SELECT date(ts,'unixepoch','localtime'), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) FROM requests WHERE source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct') GROUP BY 1").fetchall()
+    rows = c.execute("SELECT date(ts,'unixepoch','localtime'), SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) FROM requests WHERE " + LOCAL_SOURCE_SQL + " GROUP BY 1").fetchall()
     per = {d: t or 0 for d, t in rows}
     today = date.today(); end = today + timedelta(days=(5 - today.weekday()) % 7)
     start = end - timedelta(days=52 * 7 - 1 + 7); start -= timedelta(days=(start.weekday() + 1) % 7)
@@ -2151,7 +2164,7 @@ def months_join(m):
 
 def page():
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
-    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')"
+    P = LOCAL_SOURCE_SQL
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM({SPEED_SEC}) FROM requests WHERE {P} AND {SPEED_SEC}>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
@@ -2653,8 +2666,10 @@ rect.day:hover{{stroke:#e8ffe8;stroke-width:1.2}}
 <script>(function(){{
 var KEY='tad-range2';
 var HOFKEY='tad-hof-slot4';
-var active=localStorage.getItem(KEY)||'all';
-if(['all','today','dod','mtd','weekly','monthly','yearly'].indexOf(active)<0) active='all';
+var RANGES=['all','today','dod','mtd','weekly','monthly','yearly'];
+var q=new URLSearchParams(location.search).get('range');
+var active=(q&&RANGES.indexOf(q)>=0)?q:(localStorage.getItem(KEY)||'all');
+if(RANGES.indexOf(active)<0) active='all';
 function $(id){{return document.getElementById(id);}}
 function setDseg(el, text){{
   if(!el) return;
@@ -2752,7 +2767,7 @@ if(slot && sel){{
 def page_mobile():
     """Portrait mobile layout. Same data as page(); separate markup/CSS only."""
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
-    P = "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')"
+    P = LOCAL_SOURCE_SQL
     tin, tout, nreq = q(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),SUM(COALESCE(request_count,1)) FROM requests WHERE {P}")[0]
     tps = q(f"SELECT SUM(output_tokens)/SUM({SPEED_SEC}) FROM requests WHERE {P} AND {SPEED_SEC}>0 AND output_tokens>0")[0][0]
     days = devastation_day_rows(q, P, 5)
@@ -3187,8 +3202,10 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape')closeTip();
 }})();</script>
 <script>(function(){{
 var KEY='tad-range2';
-var active=localStorage.getItem(KEY)||'all';
-if(['all','today','dod','mtd','weekly','monthly','yearly'].indexOf(active)<0) active='all';
+var RANGES=['all','today','dod','mtd','weekly','monthly','yearly'];
+var q=new URLSearchParams(location.search).get('range');
+var active=(q&&RANGES.indexOf(q)>=0)?q:(localStorage.getItem(KEY)||'all');
+if(RANGES.indexOf(active)<0) active='all';
 function $(id){{return document.getElementById(id);}}
 function setDseg(el, text){{
   if(!el) return;
@@ -3754,7 +3771,7 @@ def office2d_tokens_payload(n=7):
         c = db()
         try:
             q = lambda sql, *a: c.execute(sql, a).fetchall()
-            rows = devastation_day_rows(q, "source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')", n)
+            rows = devastation_day_rows(q, LOCAL_SOURCE_SQL, n)
         finally:
             c.close()
         m = {d: a + b for d, a, b in rows}
@@ -3791,7 +3808,7 @@ def office2d_tokens_payload(n=7):
         cloud = None
     return {"days": days, "cloud": cloud, "local": local,
             "cloud_sources": "codex per-day deltas from rollouts, cached input excluded + opencode cloud sessions; grok excluded (plan % only, no token counts)",
-            "codex_with_cached": [codex_raw.get(d) for d in days], "local_source": "stats.db requests source IN ('proxy','hermes-direct','eval-direct','strata-direct','opencode-local','tensorfold-direct')", "now": time.time()}
+            "codex_with_cached": [codex_raw.get(d) for d in days], "local_source": "stats.db requests " + LOCAL_SOURCE_SQL, "now": time.time()}
 
 def office_json_payload(since_sec=None):
     now = time.time()
