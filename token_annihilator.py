@@ -1199,6 +1199,7 @@ BOT_AVATARS = {
     "Veil PM": ("#FF6700", "pumpkin"),
     "dr eggbot": ("#F4F2EE", "teardrop"),
     "dr eggbot v2": ("#E31B23", "teardrop"),
+    "Eggy": ("#E31B23", "teardrop"),
     "Zonk Bot": ("#9159FE", "cloud"),
     "Veil Assets": ("#FF309B", "flower"),
     "Veil Triage": ("#FF263C", "wedge"),
