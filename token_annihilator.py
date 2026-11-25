@@ -885,6 +885,12 @@ JOBS_CSS = """
 .jobs-panel .jidle{color:var(--muted);font-weight:700;}
 """
 
+# Desktop / only. ~40% larger jobs list (summary + rows) than the shared 10-12px clamp.
+# page_mobile() keeps JOBS_CSS unchanged.
+JOBS_CSS_DESKTOP = """
+.jobs-panel{font-size:clamp(14px,1.2vw,17px);padding:8px 12px 16px 12px;}
+"""
+
 GLOW_CSS = """
 /* Even instrument-cluster glow, ~20% stronger than the even pass. Color-matched; no radial fills. */
 .cluster{
@@ -2283,7 +2289,7 @@ def page():
 
     jobs_snap = spark_jobs_snapshot()
     jobs_panel = jobs_snap.get("panel") or ""
-    jobs_css = JOBS_CSS
+    jobs_css = JOBS_CSS + JOBS_CSS_DESKTOP
     glow_css = GLOW_CSS
 
     return f"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60><title>{T}</title><style>
